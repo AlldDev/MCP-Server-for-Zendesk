@@ -1,0 +1,5 @@
+# Troque pelo domínio público real (precisa já resolver via DNS para o IP desta instância,
+# senão o Caddy não consegue emitir o certificado Let's Encrypt).
+https://mcp.sua-empresa.com.br {
+	reverse_proxy app:8080
+}
