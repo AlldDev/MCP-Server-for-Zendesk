@@ -9,7 +9,7 @@ from mcp_zendesk.auth import BearerAuthMiddleware
 from mcp_zendesk.client import ZendeskClient
 from mcp_zendesk.config import configure_logging, load_settings
 from mcp_zendesk.models import TicketPriority, TicketStatus
-from mcp_zendesk.tools import groups, search, tickets, users
+from mcp_zendesk.tools import groups, guides, search, tickets, users
 from mcp_zendesk.webhooks import WEBHOOK_PATH, create_webhook_route
 
 configure_logging()
@@ -23,7 +23,9 @@ zendesk = ZendeskClient(
     cache_ttl_seconds=settings.cache_ttl_seconds,
 )
 
-mcp = MCPServer("zendesk", instructions="Read and write Zendesk Support tickets.")
+mcp = MCPServer(
+    "zendesk", instructions="Read and write Zendesk Support tickets, and search, read, and write Help Center articles."
+)
 
 
 @mcp.tool()
@@ -35,13 +37,14 @@ async def list_tickets(
     sort_by: str | None = None,
     sort_order: str | None = None,
     cursor: str | None = None,
+    limit: int = 25,
 ) -> dict[str, Any]:
     """List Zendesk tickets, optionally filtered by status, priority, requester email, or group
     (accepts a group name, e.g. "N1", or a numeric group ID). Each ticket includes a
     requester_name/assignee_name/group_name/organization_name when that Zendesk object is known.
     sort_by accepts "updated_at", "created_at", "priority", "status", or "ticket_type" (only
-    applies when a filter is given); sort_order is "asc" or "desc". Returns Zendesk's default
-    page (up to 100 tickets); pass the previous call's next_cursor to fetch more."""
+    applies when a filter is given); sort_order is "asc" or "desc". Returns up to limit tickets
+    (default 25, keep it low); pass the previous call's next_cursor to fetch more."""
     return await tickets.list_tickets(
         zendesk,
         status=status,
@@ -51,6 +54,7 @@ async def list_tickets(
         sort_by=sort_by,
         sort_order=sort_order,
         cursor=cursor,
+        limit=limit,
     )
 
 
@@ -105,18 +109,18 @@ async def add_comment(ticket_id: int, body: str, public: bool) -> dict[str, Any]
 
 
 @mcp.tool()
-async def get_ticket_comments(ticket_id: int, cursor: str | None = None) -> dict[str, Any]:
-    """Get a ticket's comment thread in chronological order. Pass the previous call's
-    next_cursor to fetch more."""
-    return await tickets.get_ticket_comments(zendesk, ticket_id, cursor=cursor)
+async def get_ticket_comments(ticket_id: int, cursor: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """Get a ticket's comment thread in chronological order. Returns up to limit comments
+    (default 50); pass the previous call's next_cursor to fetch more."""
+    return await tickets.get_ticket_comments(zendesk, ticket_id, cursor=cursor, limit=limit)
 
 
 @mcp.tool()
-async def get_ticket_audits(ticket_id: int, cursor: str | None = None) -> dict[str, Any]:
+async def get_ticket_audits(ticket_id: int, cursor: str | None = None, limit: int = 50) -> dict[str, Any]:
     """Get a ticket's change history (who changed what field and when). Comment-only audits
-    are omitted; use get_ticket_comments for the conversation itself. Pass the previous call's
-    next_cursor to fetch more."""
-    return await tickets.get_ticket_audits(zendesk, ticket_id, cursor=cursor)
+    are omitted; use get_ticket_comments for the conversation itself. Returns up to limit
+    audits (default 50); pass the previous call's next_cursor to fetch more."""
+    return await tickets.get_ticket_audits(zendesk, ticket_id, cursor=cursor, limit=limit)
 
 
 @mcp.tool()
@@ -125,13 +129,16 @@ async def search_tickets(
     sort_by: str | None = None,
     sort_order: str | None = None,
     cursor: str | None = None,
+    limit: int = 25,
 ) -> dict[str, Any]:
     """Search tickets by free text or Zendesk structured query syntax (e.g. "status:open priority:high").
     Each ticket includes a requester_name/assignee_name/group_name/organization_name when that
     Zendesk object is known. sort_by accepts "updated_at", "created_at", "priority", "status",
-    or "ticket_type"; sort_order is "asc" or "desc". Returns Zendesk's default page (up to 100
-    results); pass the previous call's next_cursor to fetch more."""
-    return await search.search_tickets(zendesk, query, sort_by=sort_by, sort_order=sort_order, cursor=cursor)
+    or "ticket_type"; sort_order is "asc" or "desc". Returns up to limit results (default 25,
+    keep it low); pass the previous call's next_cursor to fetch more."""
+    return await search.search_tickets(
+        zendesk, query, sort_by=sort_by, sort_order=sort_order, cursor=cursor, limit=limit
+    )
 
 
 @mcp.tool()
@@ -150,6 +157,87 @@ async def list_organizations() -> dict[str, Any]:
 async def list_groups() -> dict[str, Any]:
     """List support groups registered in Zendesk (use to look up a group's ID by name)."""
     return await groups.list_groups(zendesk)
+
+
+@mcp.tool()
+async def search_guides(
+    query: str,
+    limit: int = 5,
+    page: int = 1,
+    locale: str | None = None,
+) -> dict[str, Any]:
+    """Search Help Center articles by keyword. Returns a short snippet per article (never the
+    full body) — call get_guide for an article whose snippet looks relevant. Results are
+    deduplicated across translations and near-duplicate section/title matches, then capped at
+    limit (default 5, keep it low). Help Center paging is offset-based: pass page=2 when
+    has_more is true."""
+    return await guides.search_guides(zendesk, query, limit=limit, page=page, locale=locale)
+
+
+@mcp.tool()
+async def get_guide(article_id: int) -> dict[str, Any]:
+    """Get the full content of a single Help Center article, with its HTML body converted to
+    readable text (truncated at ~8000 characters, flagged via truncated). If the article is
+    restricted, raises a clear error naming the article instead of a generic credentials error."""
+    return await guides.get_guide(zendesk, article_id)
+
+
+@mcp.tool()
+async def list_guide_categories() -> dict[str, Any]:
+    """List Help Center categories with their sections nested inside, for exploratory
+    navigation."""
+    return await guides.list_guide_categories(zendesk)
+
+
+@mcp.tool()
+async def create_guide(
+    section: str,
+    title: str,
+    body: str,
+    permission_group: str,
+    visibility: str,
+    draft: bool,
+    locale: str = "pt-br",
+) -> dict[str, Any]:
+    """Create a Help Center article. Specify draft explicitly: True creates an unpublished
+    draft, False publishes it immediately to the Help Center — decide based on what the user
+    asked, never default to one or the other. visibility is "everyone" for a publicly visible
+    article, or a user segment name/ID to restrict it. section and permission_group accept a
+    name or a numeric ID; call list_guide_permissions to discover valid values. body should be
+    HTML; plain text is wrapped in paragraphs automatically."""
+    return await guides.create_guide(
+        zendesk,
+        section,
+        title,
+        body,
+        permission_group=permission_group,
+        visibility=visibility,
+        draft=draft,
+        locale=locale,
+    )
+
+
+@mcp.tool()
+async def update_guide(
+    article_id: int,
+    title: str | None = None,
+    body: str | None = None,
+    draft: bool | None = None,
+    locale: str = "pt-br",
+) -> dict[str, Any]:
+    """Update an existing Help Center article's title, body, or draft status. Editing content
+    goes through the article's translation for locale (Zendesk does not update title/body via
+    the article endpoint directly). Provide at least one of title, body, or draft. draft has no
+    effect on prior state when omitted, unlike create_guide's required draft."""
+    return await guides.update_guide(zendesk, article_id, title=title, body=body, draft=draft, locale=locale)
+
+
+@mcp.tool()
+async def list_guide_permissions() -> dict[str, Any]:
+    """List permission groups and user segments, for filling create_guide's permission_group
+    and visibility parameters. "everyone" is also accepted as visibility without needing a
+    segment from this list."""
+    return await guides.list_guide_permissions(zendesk)
 
 
 # DNS-rebinding Host-header check defaults to only 127.0.0.1/localhost with an explicit

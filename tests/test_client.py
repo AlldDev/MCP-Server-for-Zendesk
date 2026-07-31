@@ -52,6 +52,18 @@ async def test_401_raises_without_leaking_token():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_403_raises_with_status_and_distinct_message():
+    mock_oauth_token()
+    respx.get(f"{BASE_URL}/tickets/1.json").mock(return_value=httpx.Response(403, json={}))
+    client = make_client()
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await client.get("/tickets/1.json")
+    assert exc_info.value.status == 403
+    assert "401" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_404_raises():
     mock_oauth_token()
     respx.get(f"{BASE_URL}/tickets/999.json").mock(return_value=httpx.Response(404, json={}))
@@ -120,6 +132,21 @@ async def test_write_invalidates_the_cache():
     await client.put("/tickets/1.json", json={"ticket": {"status": "open"}})
     await client.get("/tickets/1.json")
     assert get_route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_write_does_not_invalidate_unrelated_resource_cache():
+    mock_oauth_token()
+    groups_route = respx.get(f"{BASE_URL}/groups.json").mock(
+        return_value=httpx.Response(200, json={"groups": [{"id": 1}]})
+    )
+    respx.put(f"{BASE_URL}/tickets/1.json").mock(return_value=httpx.Response(200, json={"ticket": {"id": 1}}))
+    client = make_client()
+    await client.get("/groups.json")
+    await client.put("/tickets/1.json", json={"ticket": {"status": "open"}})
+    await client.get("/groups.json")
+    assert groups_route.call_count == 1
 
 
 @pytest.mark.asyncio

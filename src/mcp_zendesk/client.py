@@ -15,12 +15,22 @@ MAX_ATTEMPTS = 3
 class ZendeskAPIError(Exception):
     """Raised for Zendesk API errors, carrying a message safe to show the caller."""
 
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def _resource(path: str) -> str:
+    """Top-level resource segment of a Zendesk API path, e.g. "tickets" for
+    "/tickets/5.json" or "help_center" for "/help_center/articles/5.json"."""
+    return path.strip("/").split("/", 1)[0].split(".", 1)[0]
+
 
 class _TTLCache:
-    """Tiny in-memory cache for GET responses. Cleared wholesale on any write.
+    """Tiny in-memory cache for GET responses. Cleared by resource on write.
 
-    ponytail: whole-cache invalidation on write is a global lock, not a per-ticket
-    one; scope it to the affected ticket if write throughput ever makes that matter.
+    ponytail: invalidation is scoped by top-level resource segment, not per-ticket;
+    split further if write throughput on a single resource type ever makes that matter.
     """
 
     def __init__(self, ttl_seconds: float, clock: Callable[[], float] = time.monotonic):
@@ -41,8 +51,11 @@ class _TTLCache:
     def set(self, key: tuple[Any, ...], value: dict[str, Any]) -> None:
         self._store[key] = (self._clock() + self._ttl, value)
 
-    def clear(self) -> None:
-        self._store.clear()
+    def clear(self, prefix: str | None = None) -> None:
+        if prefix is None:
+            self._store.clear()
+        else:
+            self._store = {k: v for k, v in self._store.items() if _resource(k[0]) != prefix}
 
 
 class ZendeskClient:
@@ -74,9 +87,9 @@ class ZendeskClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    def invalidate_cache(self) -> None:
+    def invalidate_cache(self, path: str | None = None) -> None:
         if self._cache is not None:
-            self._cache.clear()
+            self._cache.clear(_resource(path) if path is not None else None)
 
     async def _ensure_token(self, force: bool = False) -> None:
         """Fetch (or refresh) the OAuth access token via the client_credentials grant.
@@ -123,12 +136,12 @@ class ZendeskClient:
 
     async def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
         data = await self.request("POST", path, **kwargs)
-        self.invalidate_cache()
+        self.invalidate_cache(path)
         return data
 
     async def put(self, path: str, **kwargs: Any) -> dict[str, Any]:
         data = await self.request("PUT", path, **kwargs)
-        self.invalidate_cache()
+        self.invalidate_cache(path)
         return data
 
     async def _send_with_retry(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -144,16 +157,20 @@ class ZendeskClient:
 
     @staticmethod
     def _parse(response: httpx.Response) -> dict[str, Any]:
-        if response.status_code in (401, 403):
-            raise ZendeskAPIError("Zendesk rejected the configured credentials (401/403).")
+        if response.status_code == 401:
+            raise ZendeskAPIError("Zendesk rejected the configured credentials (401).", status=401)
+        if response.status_code == 403:
+            raise ZendeskAPIError("Zendesk denied access to this resource (403).", status=403)
         if response.status_code == 404:
-            raise ZendeskAPIError("Resource not found in Zendesk.")
+            raise ZendeskAPIError("Resource not found in Zendesk.", status=404)
         if response.status_code == 429:
-            raise ZendeskAPIError("Zendesk rate limit exceeded; please retry later.")
+            raise ZendeskAPIError("Zendesk rate limit exceeded; please retry later.", status=429)
         if response.status_code >= 500:
-            raise ZendeskAPIError("Zendesk is temporarily unavailable; please retry later.")
+            raise ZendeskAPIError("Zendesk is temporarily unavailable; please retry later.", status=response.status_code)
         if response.status_code >= 400:
-            raise ZendeskAPIError(f"Zendesk request failed with status {response.status_code}.")
+            raise ZendeskAPIError(
+                f"Zendesk request failed with status {response.status_code}.", status=response.status_code
+            )
         if response.status_code == 204 or not response.content:
             return {}
         return response.json()

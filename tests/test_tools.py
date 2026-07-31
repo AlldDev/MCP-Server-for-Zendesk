@@ -1,6 +1,7 @@
 import pytest
 
-from mcp_zendesk.tools import groups, search, tickets, users
+from mcp_zendesk.client import ZendeskAPIError
+from mcp_zendesk.tools import groups, guides, search, tickets, users
 
 
 class FakeZendeskClient:
@@ -91,6 +92,34 @@ async def test_get_ticket_strips_noise_fields():
 
 
 @pytest.mark.asyncio
+async def test_get_ticket_truncates_long_description():
+    long_description = "word " * (tickets.DESCRIPTION_MAX_CHARS)
+    client = FakeZendeskClient({"/tickets/5.json": {"ticket": {"id": 5, "description": long_description}}})
+    result = await tickets.get_ticket(client, 5)
+    assert len(result["description"]) <= tickets.DESCRIPTION_MAX_CHARS + 1
+    assert result["description_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_drops_unset_custom_fields():
+    raw_ticket = {
+        "id": 5,
+        "custom_fields": [{"id": 1, "value": "x"}, {"id": 2, "value": None}],
+    }
+    client = FakeZendeskClient({"/tickets/5.json": {"ticket": raw_ticket}})
+    result = await tickets.get_ticket(client, 5)
+    assert result["custom_fields"] == [{"id": 1, "value": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_list_tickets_respects_limit():
+    client = FakeZendeskClient({"/tickets.json": {"tickets": []}})
+    await tickets.list_tickets(client, limit=10)
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["page[size]"] == 10
+
+
+@pytest.mark.asyncio
 async def test_create_ticket_builds_expected_payload():
     client = FakeZendeskClient({"/tickets.json": {"ticket": {"id": 10}}})
     result = await tickets.create_ticket(
@@ -176,6 +205,30 @@ async def test_get_ticket_comments_uses_cursor():
 
 
 @pytest.mark.asyncio
+async def test_get_ticket_comments_respects_limit():
+    client = FakeZendeskClient({"/tickets/7/comments.json": {"comments": []}})
+    await tickets.get_ticket_comments(client, 7, limit=10)
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["page[size]"] == 10
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_comments_truncates_long_body():
+    long_body = "word " * tickets.COMMENT_BODY_MAX_CHARS
+    client = FakeZendeskClient(
+        {
+            "/tickets/7/comments.json": {
+                "comments": [{"id": 1, "author_id": 2, "body": long_body, "public": True, "created_at": "t"}],
+            }
+        }
+    )
+    result = await tickets.get_ticket_comments(client, 7)
+    comment = result["comments"][0]
+    assert len(comment["body"]) <= tickets.COMMENT_BODY_MAX_CHARS + 1
+    assert comment["truncated"] is True
+
+
+@pytest.mark.asyncio
 async def test_get_ticket_audits_keeps_only_change_events():
     client = FakeZendeskClient(
         {
@@ -210,6 +263,39 @@ async def test_get_ticket_audits_keeps_only_change_events():
 
 
 @pytest.mark.asyncio
+async def test_get_ticket_audits_respects_limit():
+    client = FakeZendeskClient({"/tickets/7/audits.json": {"audits": []}})
+    await tickets.get_ticket_audits(client, 7, limit=10)
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["page[size]"] == 10
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_audits_truncates_long_values():
+    long_value = "word " * tickets.AUDIT_VALUE_MAX_CHARS
+    client = FakeZendeskClient(
+        {
+            "/tickets/7/audits.json": {
+                "audits": [
+                    {
+                        "id": 1,
+                        "author_id": 2,
+                        "created_at": "t1",
+                        "events": [
+                            {"type": "Change", "field_name": "description", "previous_value": long_value, "value": "short"}
+                        ],
+                    },
+                ],
+            }
+        }
+    )
+    result = await tickets.get_ticket_audits(client, 7)
+    change = result["audits"][0]["changes"][0]
+    assert len(change["previous_value"]) <= tickets.AUDIT_VALUE_MAX_CHARS + 1
+    assert change["value"] == "short"
+
+
+@pytest.mark.asyncio
 async def test_search_tickets_scopes_to_type_ticket():
     client = FakeZendeskClient({"/search.json": {"results": [{"id": 1}]}})
     result = await search.search_tickets(client, "billing issue")
@@ -241,6 +327,14 @@ async def test_search_tickets_sort_and_cursor_params():
     assert kwargs["params"]["sort_by"] == "created_at"
     assert kwargs["params"]["sort_order"] == "asc"
     assert kwargs["params"]["page[after]"] == "abc"
+
+
+@pytest.mark.asyncio
+async def test_search_tickets_respects_limit():
+    client = FakeZendeskClient({"/search.json": {"results": []}})
+    await search.search_tickets(client, "billing", limit=10)
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["page[size]"] == 10
 
 
 @pytest.mark.asyncio
@@ -340,6 +434,437 @@ async def test_list_tickets_with_numeric_group_skips_resolution():
         (
             "GET",
             "/search.json",
-            {"params": {"include": "users,groups,organizations", "query": "type:ticket group:7"}},
+            {
+                "params": {
+                    "include": "users,groups,organizations",
+                    "page[size]": 25,
+                    "query": "type:ticket group:7",
+                }
+            },
         )
     ]
+
+
+_SECTIONS = {"sections": [{"id": 10, "name": "Boletos", "category_id": 200}]}
+_CATEGORIES = {"categories": [{"id": 200, "name": "Faturamento"}]}
+
+
+@pytest.mark.asyncio
+async def test_search_guides_returns_snippet_not_body():
+    article = {
+        "id": 1,
+        "title": "Como emitir boleto",
+        "section_id": 10,
+        "html_url": "https://x.zendesk.com/hc/pt-br/articles/1",
+        "snippet": "Para <em>emitir</em> um boleto, acesse...",
+        "body": "<p>corpo completo aqui...</p>",
+        "author_id": 5,
+        "vote_sum": 10,
+        "created_at": "2020-01-01T00:00:00Z",
+        "label_names": ["faq"],
+        "edited_at": "2024-01-01T00:00:00Z",
+    }
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/search.json": {"results": [article]},
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+        }
+    )
+    result = await guides.search_guides(client, "boleto")
+    assert result["articles"] == [
+        {
+            "id": 1,
+            "title": "Como emitir boleto",
+            "snippet": "Para emitir um boleto, acesse...",
+            "section": "Boletos",
+            "url": "https://x.zendesk.com/hc/pt-br/articles/1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_guides_dedupes_translations():
+    en = {"id": 1, "title": "How to pay", "locale": "en-us", "section_id": 10, "html_url": "u-en",
+          "edited_at": "2024-01-01T00:00:00Z"}
+    pt = {"id": 1, "title": "Como pagar", "locale": "pt-br", "section_id": 10, "html_url": "u-pt",
+          "edited_at": "2024-02-01T00:00:00Z"}
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/search.json": {"results": [en, pt]},
+            "/help_center/sections.json": {"sections": []},
+            "/help_center/categories.json": {"categories": []},
+        }
+    )
+    result = await guides.search_guides(client, "pay")
+    assert result["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_guides_ranks_exact_title_first():
+    first = {"id": 1, "title": "Reembolso parcial", "section_id": 10, "html_url": "u1",
+              "edited_at": "2024-01-01T00:00:00Z"}
+    second = {"id": 2, "title": "boleto", "section_id": 11, "html_url": "u2",
+              "edited_at": "2024-01-01T00:00:00Z"}
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/search.json": {"results": [first, second]},
+            "/help_center/sections.json": {"sections": []},
+            "/help_center/categories.json": {"categories": []},
+        }
+    )
+    result = await guides.search_guides(client, "boleto")
+    assert result["articles"][0]["id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_guide_cleans_html():
+    html_body = (
+        "<style>.x{color:red}</style>"
+        "<h2>Passo 1</h2>"
+        "<p>Acesse o portal &amp; clique em <a href='https://x.com'>continuar</a>.</p>"
+        "<ul><li>Item um</li><li>Item dois</li></ul>"
+        "<script>alert(1)</script>"
+    )
+    article = {
+        "id": 5,
+        "title": "Guia de pagamento",
+        "section_id": 10,
+        "html_url": "u5",
+        "locale": "pt-br",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "body": html_body,
+    }
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/5.json": {"article": article},
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+        }
+    )
+    result = await guides.get_guide(client, 5)
+    assert set(result.keys()) == {"id", "title", "body", "url", "category", "section", "updated_at", "locale"}
+    assert "alert(1)" not in result["body"]
+    assert "color:red" not in result["body"]
+    assert "## Passo 1" in result["body"]
+    assert "- Item um" in result["body"]
+    assert "- Item dois" in result["body"]
+    assert "Acesse o portal & clique em continuar." in result["body"]
+    assert result["section"] == "Boletos"
+    assert result["category"] == "Faturamento"
+
+
+@pytest.mark.asyncio
+async def test_get_guide_truncates_long_body():
+    long_body = "<p>" + ("palavra " * 2000) + "</p>"
+    article = {
+        "id": 6,
+        "title": "Artigo longo",
+        "section_id": None,
+        "html_url": "u6",
+        "locale": "pt-br",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "body": long_body,
+    }
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/6.json": {"article": article},
+            "/help_center/sections.json": {"sections": []},
+            "/help_center/categories.json": {"categories": []},
+        }
+    )
+    result = await guides.get_guide(client, 6)
+    assert result["truncated"] is True
+    assert len(result["body"]) <= guides.MAX_BODY_CHARS + 1
+
+
+@pytest.mark.asyncio
+async def test_get_guide_restricted_article_message():
+    class _RestrictedClient(FakeZendeskClient):
+        async def get(self, path, **kwargs):
+            if path == "/help_center/articles/999.json":
+                raise ZendeskAPIError("denied", status=403)
+            return await super().get(path, **kwargs)
+
+    client = _RestrictedClient({})
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await guides.get_guide(client, 999)
+    assert "restricted" in str(exc_info.value)
+    assert "999" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_list_guide_categories_nests_sections():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": {
+                "sections": [
+                    {"id": 10, "name": "Boletos", "category_id": 200},
+                    {"id": 11, "name": "Cartões", "category_id": 200},
+                    {"id": 12, "name": "Contas", "category_id": 201},
+                ]
+            },
+            "/help_center/categories.json": {
+                "categories": [
+                    {"id": 200, "name": "Faturamento"},
+                    {"id": 201, "name": "Cadastro"},
+                ]
+            },
+        }
+    )
+    result = await guides.list_guide_categories(client)
+    assert result == {
+        "count": 2,
+        "categories": [
+            {"id": 200, "name": "Faturamento", "sections": [
+                {"id": 10, "name": "Boletos"}, {"id": 11, "name": "Cartões"}]},
+            {"id": 201, "name": "Cadastro", "sections": [{"id": 12, "name": "Contas"}]},
+        ],
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_guide_builds_expected_payload():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+            "/help_center/sections/10/articles.json": {
+                "article": {
+                    "id": 99,
+                    "title": "Novo artigo",
+                    "html_url": "u99",
+                    "section_id": 10,
+                    "updated_at": "t",
+                    "locale": "pt-br",
+                    "draft": True,
+                    "permission_group_id": 42,
+                    "user_segment_id": None,
+                }
+            },
+        }
+    )
+    result = await guides.create_guide(
+        client, "Boletos", "Novo artigo", "<p>Conteudo</p>", permission_group="42", visibility="everyone", draft=True
+    )
+    assert result == {
+        "id": 99,
+        "title": "Novo artigo",
+        "updated_at": "t",
+        "locale": "pt-br",
+        "draft": True,
+        "permission_group_id": 42,
+        "user_segment_id": None,
+        "url": "u99",
+        "section": "Boletos",
+    }
+    assert len(client.calls) == 3
+    method, path, kwargs = client.calls[-1]
+    assert (method, path) == ("POST", "/help_center/sections/10/articles.json")
+    assert kwargs["json"]["article"] == {
+        "title": "Novo artigo",
+        "body": "<p>Conteudo</p>",
+        "locale": "pt-br",
+        "permission_group_id": 42,
+        "user_segment_id": None,
+        "draft": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_guide_requires_explicit_draft():
+    client = FakeZendeskClient({})
+    with pytest.raises(TypeError):
+        await guides.create_guide(client, "Boletos", "T", "B", permission_group="1", visibility="everyone")
+
+
+@pytest.mark.asyncio
+async def test_create_guide_resolves_section_and_permission_group_by_name():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+            "/guide/permission_groups.json": {"permission_groups": [{"id": 42, "name": "Agents and Managers"}]},
+            "/help_center/sections/10/articles.json": {
+                "article": {
+                    "id": 100,
+                    "title": "T",
+                    "html_url": "u100",
+                    "section_id": 10,
+                    "updated_at": "t",
+                    "locale": "pt-br",
+                    "draft": True,
+                    "permission_group_id": 42,
+                    "user_segment_id": None,
+                }
+            },
+        }
+    )
+    result = await guides.create_guide(
+        client, "Boletos", "T", "B", permission_group="Agents and Managers", visibility="everyone", draft=True
+    )
+    assert result["permission_group_id"] == 42
+    assert client.calls[-1][2]["json"]["article"]["permission_group_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_create_guide_resolves_visibility_segment_by_name():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+            "/help_center/user_segments.json": {"user_segments": [{"id": 7, "name": "Signed-in users"}]},
+            "/help_center/sections/10/articles.json": {
+                "article": {
+                    "id": 101,
+                    "title": "T",
+                    "html_url": "u101",
+                    "section_id": 10,
+                    "updated_at": "t",
+                    "locale": "pt-br",
+                    "draft": False,
+                    "permission_group_id": 42,
+                    "user_segment_id": 7,
+                }
+            },
+        }
+    )
+    result = await guides.create_guide(
+        client, "Boletos", "T", "B", permission_group="42", visibility="Signed-in users", draft=False
+    )
+    assert result["user_segment_id"] == 7
+    assert client.calls[-1][2]["json"]["article"]["user_segment_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_create_guide_ambiguous_section_name_raises():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": {
+                "sections": [
+                    {"id": 20, "name": "FAQ", "category_id": 200},
+                    {"id": 21, "name": "FAQ", "category_id": 201},
+                ]
+            },
+            "/help_center/categories.json": {"categories": []},
+        }
+    )
+    with pytest.raises(ValueError, match="Multiple"):
+        await guides.create_guide(client, "FAQ", "T", "B", permission_group="1", visibility="everyone", draft=True)
+
+
+@pytest.mark.asyncio
+async def test_create_guide_wraps_plain_text_body():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+            "/help_center/sections/10/articles.json": {
+                "article": {"id": 102, "title": "T", "html_url": "u", "section_id": 10, "updated_at": "t", "locale": "pt-br",
+                            "draft": True, "permission_group_id": 1, "user_segment_id": None}
+            },
+        }
+    )
+    await guides.create_guide(
+        client, "Boletos", "T", "Linha um.\n\nLinha dois & tal.", permission_group="1", visibility="everyone", draft=True
+    )
+    sent_body = client.calls[-1][2]["json"]["article"]["body"]
+    assert sent_body == "<p>Linha um.</p>\n<p>Linha dois &amp; tal.</p>"
+
+
+@pytest.mark.asyncio
+async def test_create_guide_passes_html_body_through():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": _SECTIONS,
+            "/help_center/categories.json": _CATEGORIES,
+            "/help_center/sections/10/articles.json": {
+                "article": {"id": 103, "title": "T", "html_url": "u", "section_id": 10, "updated_at": "t", "locale": "pt-br",
+                            "draft": True, "permission_group_id": 1, "user_segment_id": None}
+            },
+        }
+    )
+    await guides.create_guide(
+        client, "Boletos", "T", "<p>Já é HTML</p>", permission_group="1", visibility="everyone", draft=True
+    )
+    sent_body = client.calls[-1][2]["json"]["article"]["body"]
+    assert sent_body == "<p>Já é HTML</p>"
+
+
+@pytest.mark.asyncio
+async def test_update_guide_uses_translations_endpoint():
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/5/translations/pt-br.json": {
+                "translation": {"id": 1, "title": "T atualizado", "locale": "pt-br", "draft": False, "updated_at": "t2"}
+            }
+        }
+    )
+    result = await guides.update_guide(client, 5, title="T atualizado")
+    assert result == {"id": 1, "title": "T atualizado", "locale": "pt-br", "draft": False, "updated_at": "t2"}
+    method, path, kwargs = client.calls[0]
+    assert (method, path) == ("PUT", "/help_center/articles/5/translations/pt-br.json")
+    assert kwargs["json"]["translation"] == {"title": "T atualizado"}
+
+
+@pytest.mark.asyncio
+async def test_update_guide_only_sends_given_fields():
+    client = FakeZendeskClient({"/help_center/articles/5/translations/pt-br.json": {"translation": {"id": 1}}})
+    await guides.update_guide(client, 5, draft=True)
+    assert client.calls[0][2]["json"]["translation"] == {"draft": True}
+
+
+@pytest.mark.asyncio
+async def test_update_guide_requires_at_least_one_field():
+    client = FakeZendeskClient({})
+    with pytest.raises(ValueError, match="at least one"):
+        await guides.update_guide(client, 5)
+
+
+@pytest.mark.asyncio
+async def test_update_guide_restricted_article_message():
+    class _RestrictedUpdateClient(FakeZendeskClient):
+        async def put(self, path, **kwargs):
+            if path == "/help_center/articles/999/translations/pt-br.json":
+                raise ZendeskAPIError("denied", status=403)
+            return await super().put(path, **kwargs)
+
+    client = _RestrictedUpdateClient({})
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await guides.update_guide(client, 999, title="X")
+    assert "999" in str(exc_info.value)
+    assert "permission" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_list_guide_permissions_trims_fields():
+    client = FakeZendeskClient(
+        {
+            "/help_center/user_segments.json": {
+                "user_segments": [{"id": 7, "name": "Signed-in users", "built_in": True, "user_type": "signed_in_users"}]
+            },
+            "/guide/permission_groups.json": {
+                "permission_groups": [{"id": 42, "name": "Agents and Managers", "built_in": True, "edit": [], "publish": []}]
+            },
+        }
+    )
+    result = await guides.list_guide_permissions(client)
+    assert result == {
+        "permission_groups": [{"id": 42, "name": "Agents and Managers"}],
+        "user_segments": [{"id": 7, "name": "Signed-in users"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_guide_permissions_restricted_message():
+    class _RestrictedPermissionsClient(FakeZendeskClient):
+        async def get(self, path, **kwargs):
+            if path == "/guide/permission_groups.json":
+                raise ZendeskAPIError("denied", status=403)
+            return await super().get(path, **kwargs)
+
+    client = _RestrictedPermissionsClient({"/help_center/user_segments.json": {"user_segments": []}})
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await guides.list_guide_permissions(client)
+    assert "numeric ID" in str(exc_info.value)

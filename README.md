@@ -5,24 +5,43 @@ Servidor MCP (Model Context Protocol) em Python que expõe operações do Zendes
 ## Funcionalidades
 
 **Chamados (tickets)**
-- `list_tickets` — lista chamados, com filtro opcional por status, prioridade, e-mail do solicitante ou grupo; ordenação (`sort_by`/`sort_order`) e paginação por cursor.
-- `get_ticket` — detalhes completos de um chamado por ID.
+- `list_tickets` — lista chamados, com filtro opcional por status, prioridade, e-mail do solicitante ou grupo; ordenação (`sort_by`/`sort_order`), paginação por cursor e `limit` de resultados por chamada (padrão 25).
+- `get_ticket` — detalhes completos de um chamado por ID; descrição longa é truncada (avisa via `description_truncated`).
 - `create_ticket` — abre um novo chamado.
 - `update_ticket` — altera status, prioridade, atendente ou tags.
 - `add_comment` — adiciona um comentário público ou nota interna (visibilidade sempre explícita).
-- `get_ticket_comments` — histórico de comentários do chamado, em ordem cronológica (paginado).
-- `get_ticket_audits` — histórico de mudanças do chamado (quem alterou o quê e quando).
+- `get_ticket_comments` — histórico de comentários do chamado, em ordem cronológica, paginado e limitado (`limit`, padrão 50); corpo de comentário longo é truncado.
+- `get_ticket_audits` — histórico de mudanças do chamado (quem alterou o quê e quando), paginado e limitado (`limit`, padrão 50); valores longos são truncados.
 
 **Busca**
-- `search_tickets` — busca por texto livre ou sintaxe estruturada do Zendesk (`status:open priority:high`), com ordenação e paginação por cursor.
+- `search_tickets` — busca por texto livre ou sintaxe estruturada do Zendesk (`status:open priority:high`), com ordenação, paginação por cursor e `limit` de resultados (padrão 25).
 
 **Usuários e organização**
 - `get_user` — busca um usuário por ID ou e-mail.
 - `list_organizations` — lista organizações cadastradas.
 - `list_groups` — lista grupos de atendimento (usado também para resolver nome de grupo em `list_tickets`).
 
+**Help Center (guias)**
+- `search_guides` — busca artigos por palavra-chave; devolve só snippet (≈280 caracteres), nunca o corpo, com limite baixo por padrão (5).
+- `get_guide` — conteúdo completo de um artigo, com HTML convertido para texto legível e truncado em 8.000 caracteres (avisa via `truncated`). Artigo restrito (403) retorna mensagem clara em vez do erro genérico de credencial.
+- `list_guide_categories` — categorias com as seções já aninhadas dentro, para navegação exploratória.
+- `create_guide` — cria um artigo; `draft` (rascunho ou já publicado) e `visibility` são sempre explícitos, nunca têm valor padrão. `section` e `permission_group` aceitam nome ou ID numérico.
+- `update_guide` — altera título, corpo ou status de publicação de um artigo existente (via tradução do `locale`, já que o Zendesk não edita título/corpo pelo endpoint de artigo).
+- `list_guide_permissions` — lista permission groups e user segments disponíveis, para preencher `permission_group` e `visibility` de `create_guide`.
+
 Todas as respostas trazem só os campos relevantes (não o objeto bruto do Zendesk); as listagens de
-chamados já incluem nome do solicitante/atendente/grupo/organização, sem chamadas extras.
+chamados já incluem nome do solicitante/atendente/grupo/organização, sem chamadas extras. Campos de
+texto longos (descrição de chamado, corpo de comentário, valores de auditoria) são truncados com um
+aviso em vez de estourar o contexto, e as tools de listagem/busca aceitam `limit` com um valor baixo
+por padrão, para favorecer poucos resultados bem filtrados em vez de páginas longas e genéricas.
+
+As guias aplicam otimizações extras, pensadas para reduzir volume de contexto: `search_guides` nunca
+devolve o corpo do artigo, só um snippet curto; campos irrelevantes da API (labels, autor, contador de
+votos, timestamps de criação) são descartados; traduções do mesmo artigo e entradas quase idênticas
+(mesma seção, título praticamente igual) são deduplicadas, mantendo a mais recentemente editada; a
+ordem de relevância da própria busca do Zendesk é preservada, só promovendo casamento exato de título;
+e o corpo de `get_guide` é truncado em 8.000 caracteres para não estourar contexto quando vários
+artigos são pedidos em sequência.
 
 ## 1. Instalação
 
@@ -241,10 +260,13 @@ Duas otimizações desabilitadas por padrão se as variáveis correspondentes n�
 
 `CACHE_TTL_SECONDS` (padrão: 30) mantém em memória, por até esse número de segundos, o resultado das
 tools de leitura (`list_tickets`, `get_ticket`, `search_tickets`, `get_user`, `list_organizations`,
-`list_groups`). Qualquer escrita feita pelo próprio servidor (`create_ticket`, `update_ticket`,
-`add_comment`) limpa o cache inteiro na hora, então o risco é só de não enxergar, por até
-`CACHE_TTL_SECONDS` segundos, mudanças feitas fora do MCP (direto no Zendesk, ou por outro sistema).
-Defina `CACHE_TTL_SECONDS=0` para desativar o cache.
+`list_groups`, `search_guides`, `get_guide`, `list_guide_categories`). Qualquer escrita feita pelo
+próprio servidor (`create_ticket`, `update_ticket`, `add_comment`, `create_guide`, `update_guide`)
+limpa na hora só o cache do tipo de recurso afetado — escrever um chamado não derruba o cache de
+artigos do Help Center (nem de grupos, organizações etc.), e vice-versa. O evento de webhook (abaixo),
+por não saber qual recurso mudou, ainda limpa o cache inteiro. O risco remanescente é só de não
+enxergar, por até `CACHE_TTL_SECONDS` segundos, mudanças no mesmo tipo de recurso feitas fora do MCP
+(direto no Zendesk, ou por outro sistema). Defina `CACHE_TTL_SECONDS=0` para desativar o cache.
 
 ### Webhook do Zendesk
 

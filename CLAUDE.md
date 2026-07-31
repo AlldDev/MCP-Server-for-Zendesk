@@ -36,8 +36,8 @@ Request flow: `BearerAuthMiddleware` (auth.py) wraps the whole ASGI app → MCP'
 - **`server.py`** is the composition root: builds the singleton `ZendeskClient` from `Settings`, registers
   every `@mcp.tool()`, mounts the webhook route (if configured), and wraps everything in
   `BearerAuthMiddleware`. Each `@mcp.tool()` function is a thin adapter that just calls into `tools/`.
-- **`tools/*.py`** hold the actual per-resource logic (tickets, search, users, groups) and take a
-  `ZendeskClient` as their first argument — they're plain functions, not classes, and are what
+- **`tools/*.py`** hold the actual per-resource logic (tickets, search, users, groups, guides) and take
+  a `ZendeskClient` as their first argument — they're plain functions, not classes, and are what
   `tests/test_tools.py` exercises directly against a `FakeZendeskClient` (no real HTTP/respx needed there).
 - **`client.py`** (`ZendeskClient`) is the only thing that talks to Zendesk. It owns three concerns at
   once: OAuth `client_credentials` token lifecycle (auto-fetch, early refresh ~30s before expiry, forced
@@ -65,6 +65,31 @@ Request flow: `BearerAuthMiddleware` (auth.py) wraps the whole ASGI app → MCP'
 - `add_comment(..., public=False)` creates an internal note; both the tool docstring and
   `tools/tickets.add_comment` flag that internal notes may carry sensitive internal context that shouldn't
   be surfaced unless the user explicitly asked for it — preserve that behavior in any related change.
+- **`tools/guides.py`** exposes Help Center reads (`search_guides`, `get_guide`, `list_guide_categories`)
+  and writes (`create_guide`, `update_guide`, `list_guide_permissions`) over the same
+  OAuth-authenticated `ZendeskClient` — no separate auth path. Return payloads are deliberately lossy
+  to keep context small: `search_guides` never returns the article body (only a ~280-char snippet),
+  drops Zendesk metadata noise (labels, author, vote counts), deduplicates translations/near-duplicate
+  results, and caps at `limit` (default 5); `get_guide` converts the HTML body to plain text via
+  stdlib `html.parser` and truncates at `MAX_BODY_CHARS` (flagged via `truncated`). A 403 from
+  `ZendeskClient` (`ZendeskAPIError.status == 403`) is caught in `get_guide`/`update_guide` and
+  re-raised with a message naming the restricted article, instead of leaking the generic 401/403
+  credentials message.
+  - Three Help Center API traps that shape the write path — don't "simplify" past them:
+    1. **Creating an article requires `permission_group_id`** (plus `locale`/`title`); there's no way
+       around it, hence `list_guide_permissions` for discovery.
+    2. **`PUT /help_center/articles/{id}` cannot change title/body.** Editing content goes through
+       `PUT /help_center/articles/{id}/translations/{locale}` instead — `update_guide` uses that
+       endpoint, not the article one.
+    3. **Permission groups live under `/guide/permission_groups.json`** (not `/help_center/`), and
+       only a Help Center manager can list them. `section`/`permission_group`/`visibility` in
+       `create_guide` all accept a name *or* a numeric ID (via `guides._resolve_ref`) so a caller
+       whose credentials can't list permission groups can still pass one by ID.
+  - `create_guide`'s `draft: bool` and `visibility: str` have no default — same reasoning as
+    `add_comment(..., public)` below: publishing an article is externally visible and hard to walk
+    back, so the caller must decide explicitly rather than the tool assuming. `update_guide`'s `draft`
+    *does* default to `None` (leave publication state alone) since there's a prior state to preserve
+    on edit, unlike on create.
 
 ## Testing conventions
 

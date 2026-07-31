@@ -14,11 +14,25 @@ USER_FIELDS = {"id", "name", "email", "role", "organization_id", "tags", "create
 ORGANIZATION_FIELDS = {"id", "name", "domain_names", "tags", "created_at", "updated_at"}
 GROUP_FIELDS = {"id", "name", "default"}
 COMMENT_FIELDS = {"id", "author_id", "body", "public", "created_at"}
+ARTICLE_DETAIL_FIELDS = {"id", "title", "html_url", "section_id", "updated_at", "locale"}
+ARTICLE_WRITE_FIELDS = ARTICLE_DETAIL_FIELDS | {"draft", "permission_group_id", "user_segment_id"}
+TRANSLATION_FIELDS = {"id", "title", "locale", "draft", "updated_at"}
+GUIDE_REF_FIELDS = {"id", "name"}
 
 
 def project(obj: dict[str, Any], fields: set[str]) -> dict[str, Any]:
     """Trim a raw Zendesk API object down to the fields useful to an assistant."""
     return {k: v for k, v in obj.items() if k in fields}
+
+
+def truncate(text: str, max_chars: int) -> tuple[str, bool]:
+    """Cut text at a word boundary near max_chars, appending an ellipsis if trimmed."""
+    if len(text) <= max_chars:
+        return text, False
+    cut = text.rfind(" ", 0, max_chars)
+    if cut <= 0:
+        cut = max_chars
+    return text[:cut].rstrip() + "…", True
 
 
 def project_list(objs: list[dict[str, Any]], fields: set[str]) -> list[dict[str, Any]]:
