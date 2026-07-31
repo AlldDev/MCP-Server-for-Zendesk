@@ -39,6 +39,25 @@ def project_list(objs: list[dict[str, Any]], fields: set[str]) -> list[dict[str,
     return [project(o, fields) for o in objs]
 
 
+def offset_page_params(cursor: str | None, limit: int) -> dict[str, Any]:
+    """Classic offset-pagination params (page/per_page) for a Search-style Zendesk endpoint,
+    from an opaque page-number cursor."""
+    params: dict[str, Any] = {"per_page": max(1, min(limit, 100))}
+    if cursor:
+        try:
+            params["page"] = int(cursor)
+        except ValueError:
+            raise ValueError(f"Invalid cursor {cursor!r}; pass the next_cursor from a previous call.") from None
+    return params
+
+
+def offset_next_cursor(cursor: str | None, has_more: bool) -> str | None:
+    """Advance an opaque page-number cursor when the endpoint reports another page."""
+    if not has_more:
+        return None
+    return str((int(cursor) if cursor else 1) + 1)
+
+
 def build_name_maps(data: dict[str, Any]) -> dict[str, dict[int, str]]:
     """Build id->name lookups from a Zendesk response sideloaded via include=users,groups,organizations."""
     return {

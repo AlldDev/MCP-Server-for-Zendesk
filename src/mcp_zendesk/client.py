@@ -169,7 +169,8 @@ class ZendeskClient:
             raise ZendeskAPIError("Zendesk is temporarily unavailable; please retry later.", status=response.status_code)
         if response.status_code >= 400:
             raise ZendeskAPIError(
-                f"Zendesk request failed with status {response.status_code}.", status=response.status_code
+                f"Zendesk request failed with status {response.status_code}: {response.text[:500]}",
+                status=response.status_code,
             )
         if response.status_code == 204 or not response.content:
             return {}

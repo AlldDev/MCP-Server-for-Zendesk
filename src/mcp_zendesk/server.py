@@ -24,7 +24,14 @@ zendesk = ZendeskClient(
 )
 
 mcp = MCPServer(
-    "zendesk", instructions="Read and write Zendesk Support tickets, and search, read, and write Help Center articles."
+    "zendesk",
+    instructions=(
+        "Manage two distinct kinds of Zendesk content — don't conflate them. Support tickets are "
+        "individual customer conversations/requests (list/get/create/update/comment). Help Center "
+        "articles are public knowledge-base documentation (search/get/create/update, browsable via "
+        "categories). A request about a customer's issue is a ticket; a request for a how-to or "
+        "reference is a Help Center article."
+    ),
 )
 
 
@@ -39,12 +46,14 @@ async def list_tickets(
     cursor: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """List Zendesk tickets, optionally filtered by status, priority, requester email, or group
-    (accepts a group name, e.g. "N1", or a numeric group ID). Each ticket includes a
-    requester_name/assignee_name/group_name/organization_name when that Zendesk object is known.
-    sort_by accepts "updated_at", "created_at", "priority", "status", or "ticket_type" (only
-    applies when a filter is given); sort_order is "asc" or "desc". Returns up to limit tickets
-    (default 25, keep it low); pass the previous call's next_cursor to fetch more."""
+    """List Zendesk Support tickets (customer conversations/requests) — not Help Center articles;
+    use list_guide_categories/search_guides to browse or find documentation instead. Optionally
+    filtered by status, priority, requester email, or group (accepts a group name, e.g. "N1", or
+    a numeric group ID). Each ticket includes a requester_name/assignee_name/group_name/
+    organization_name when that Zendesk object is known. sort_by accepts "updated_at",
+    "created_at", "priority", "status", or "ticket_type" (only applies when a filter is given);
+    sort_order is "asc" or "desc". Returns up to limit tickets (default 25, keep it low); pass
+    the previous call's next_cursor to fetch more."""
     return await tickets.list_tickets(
         zendesk,
         status=status,
@@ -60,7 +69,8 @@ async def list_tickets(
 
 @mcp.tool()
 async def get_ticket(ticket_id: int) -> dict[str, Any]:
-    """Get full details for a single Zendesk ticket by ID."""
+    """Get full details for a single Zendesk Support ticket (a customer conversation/request)
+    by ID — not a Help Center article; use get_guide for that."""
     return await tickets.get_ticket(zendesk, ticket_id)
 
 
@@ -73,7 +83,8 @@ async def create_ticket(
     tags: list[str] | None = None,
     custom_fields: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create a new Zendesk ticket."""
+    """Create a new Zendesk Support ticket (a customer conversation/request) — not a Help Center
+    article; use create_guide to publish documentation instead."""
     return await tickets.create_ticket(
         zendesk,
         subject=subject,
@@ -93,7 +104,8 @@ async def update_ticket(
     assignee_email: str | None = None,
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Update a ticket's status, priority, assignee, or tags."""
+    """Update a Zendesk Support ticket's status, priority, assignee, or tags — not a Help Center
+    article; use update_guide for that."""
     return await tickets.update_ticket(
         zendesk, ticket_id, status=status, priority=priority, assignee_email=assignee_email, tags=tags
     )
@@ -131,11 +143,13 @@ async def search_tickets(
     cursor: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Search tickets by free text or Zendesk structured query syntax (e.g. "status:open priority:high").
-    Each ticket includes a requester_name/assignee_name/group_name/organization_name when that
-    Zendesk object is known. sort_by accepts "updated_at", "created_at", "priority", "status",
-    or "ticket_type"; sort_order is "asc" or "desc". Returns up to limit results (default 25,
-    keep it low); pass the previous call's next_cursor to fetch more."""
+    """Search Zendesk Support tickets (customer support conversations/requests) by free text or
+    structured query syntax (e.g. "status:open priority:high") — not Help Center articles or
+    documentation; use search_guides for how-to/reference content. Each ticket includes a
+    requester_name/assignee_name/group_name/organization_name when that Zendesk object is known.
+    sort_by accepts "updated_at", "created_at", "priority", "status", or "ticket_type"; sort_order
+    is "asc" or "desc". Returns up to limit results (default 25, keep it low); pass the previous
+    call's next_cursor to fetch more."""
     return await search.search_tickets(
         zendesk, query, sort_by=sort_by, sort_order=sort_order, cursor=cursor, limit=limit
     )
@@ -166,26 +180,29 @@ async def search_guides(
     page: int = 1,
     locale: str | None = None,
 ) -> dict[str, Any]:
-    """Search Help Center articles by keyword. Returns a short snippet per article (never the
-    full body) — call get_guide for an article whose snippet looks relevant. Results are
-    deduplicated across translations and near-duplicate section/title matches, then capped at
-    limit (default 5, keep it low). Help Center paging is offset-based: pass page=2 when
-    has_more is true."""
+    """Search Help Center articles (knowledge-base documentation/how-to content) by keyword —
+    not support tickets; use search_tickets for a customer's actual conversation/request
+    history. Returns a short snippet per article (never the full body) — call get_guide for an
+    article whose snippet looks relevant. Results are deduplicated across translations and
+    near-duplicate section/title matches, then capped at limit (default 5, keep it low). Help
+    Center paging is offset-based: pass page=2 when has_more is true."""
     return await guides.search_guides(zendesk, query, limit=limit, page=page, locale=locale)
 
 
 @mcp.tool()
 async def get_guide(article_id: int) -> dict[str, Any]:
-    """Get the full content of a single Help Center article, with its HTML body converted to
-    readable text (truncated at ~8000 characters, flagged via truncated). If the article is
-    restricted, raises a clear error naming the article instead of a generic credentials error."""
+    """Get the full content of a single Help Center article (knowledge-base documentation) by
+    ID — not a support ticket; use get_ticket for that. HTML body is converted to readable text
+    (truncated at ~8000 characters, flagged via truncated). If the article is restricted, raises
+    a clear error naming the article instead of a generic credentials error."""
     return await guides.get_guide(zendesk, article_id)
 
 
 @mcp.tool()
 async def list_guide_categories() -> dict[str, Any]:
-    """List Help Center categories with their sections nested inside, for exploratory
-    navigation."""
+    """List Help Center categories (knowledge-base documentation, not support tickets — use
+    list_tickets/search_tickets for actual customer conversations) with their sections nested
+    inside, for exploratory navigation."""
     return await guides.list_guide_categories(zendesk)
 
 
@@ -199,12 +216,13 @@ async def create_guide(
     draft: bool,
     locale: str = "pt-br",
 ) -> dict[str, Any]:
-    """Create a Help Center article. Specify draft explicitly: True creates an unpublished
-    draft, False publishes it immediately to the Help Center — decide based on what the user
-    asked, never default to one or the other. visibility is "everyone" for a publicly visible
-    article, or a user segment name/ID to restrict it. section and permission_group accept a
-    name or a numeric ID; call list_guide_permissions to discover valid values. body should be
-    HTML; plain text is wrapped in paragraphs automatically."""
+    """Create a Help Center article (knowledge-base documentation) — not a support ticket; use
+    create_ticket for a customer request instead. Specify draft explicitly: True creates an
+    unpublished draft, False publishes it immediately to the Help Center — decide based on what
+    the user asked, never default to one or the other. visibility is "everyone" for a publicly
+    visible article, or a user segment name/ID to restrict it. section and permission_group
+    accept a name or a numeric ID; call list_guide_permissions to discover valid values. body
+    should be HTML; plain text is wrapped in paragraphs automatically."""
     return await guides.create_guide(
         zendesk,
         section,
@@ -225,10 +243,11 @@ async def update_guide(
     draft: bool | None = None,
     locale: str = "pt-br",
 ) -> dict[str, Any]:
-    """Update an existing Help Center article's title, body, or draft status. Editing content
-    goes through the article's translation for locale (Zendesk does not update title/body via
-    the article endpoint directly). Provide at least one of title, body, or draft. draft has no
-    effect on prior state when omitted, unlike create_guide's required draft."""
+    """Update an existing Help Center article's title, body, or draft status — not a support
+    ticket; use update_ticket for that. Editing content goes through the article's translation
+    for locale (Zendesk does not update title/body via the article endpoint directly). Provide
+    at least one of title, body, or draft. draft has no effect on prior state when omitted,
+    unlike create_guide's required draft."""
     return await guides.update_guide(zendesk, article_id, title=title, body=body, draft=draft, locale=locale)
 
 

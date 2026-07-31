@@ -1,25 +1,34 @@
 import pytest
 
 from mcp_zendesk.client import ZendeskAPIError
-from mcp_zendesk.tools import groups, guides, search, tickets, users
+from mcp_zendesk.tools import fields, groups, guides, search, tickets, users
 
 
 class FakeZendeskClient:
-    def __init__(self, responses: dict[str, dict]):
+    def __init__(self, responses: dict[str, dict | list[dict]]):
         self._responses = responses
+        self._call_counts: dict[str, int] = {}
         self.calls: list[tuple[str, str, dict]] = []
+
+    def _response_for(self, path: str) -> dict:
+        value = self._responses[path]
+        if isinstance(value, list):
+            index = self._call_counts.get(path, 0)
+            self._call_counts[path] = index + 1
+            return value[index]
+        return value
 
     async def get(self, path: str, **kwargs) -> dict:
         self.calls.append(("GET", path, kwargs))
-        return self._responses[path]
+        return self._response_for(path)
 
     async def post(self, path: str, **kwargs) -> dict:
         self.calls.append(("POST", path, kwargs))
-        return self._responses[path]
+        return self._response_for(path)
 
     async def put(self, path: str, **kwargs) -> dict:
         self.calls.append(("PUT", path, kwargs))
-        return self._responses[path]
+        return self._response_for(path)
 
 
 @pytest.mark.asyncio
@@ -50,6 +59,17 @@ async def test_list_tickets_with_filters_uses_search():
 
 
 @pytest.mark.asyncio
+async def test_list_tickets_filtered_branch_uses_offset_pagination():
+    client = FakeZendeskClient({"/search.json": {"results": [], "next_page": "https://x/search.json?page=2"}})
+    result = await tickets.list_tickets(client, status="open")
+    _, _, kwargs = client.calls[0]
+    assert "page[size]" not in kwargs["params"]
+    assert "page[after]" not in kwargs["params"]
+    assert kwargs["params"]["per_page"] == 25
+    assert result["next_cursor"] == "2"
+
+
+@pytest.mark.asyncio
 async def test_list_tickets_attaches_sideloaded_names():
     client = FakeZendeskClient(
         {
@@ -67,13 +87,13 @@ async def test_list_tickets_attaches_sideloaded_names():
 
 @pytest.mark.asyncio
 async def test_list_tickets_sort_and_cursor_params():
-    client = FakeZendeskClient({"/search.json": {"results": [], "meta": {"has_more": True, "after_cursor": "abc"}}})
-    result = await tickets.list_tickets(client, status="open", sort_by="priority", sort_order="desc", cursor="xyz")
-    assert result["next_cursor"] == "abc"
+    client = FakeZendeskClient({"/search.json": {"results": [], "next_page": "https://x/search.json?page=6"}})
+    result = await tickets.list_tickets(client, status="open", sort_by="priority", sort_order="desc", cursor="5")
+    assert result["next_cursor"] == "6"
     _, _, kwargs = client.calls[0]
     assert kwargs["params"]["sort_by"] == "priority"
     assert kwargs["params"]["sort_order"] == "desc"
-    assert kwargs["params"]["page[after]"] == "xyz"
+    assert kwargs["params"]["page"] == 5
 
 
 @pytest.mark.asyncio
@@ -322,11 +342,11 @@ async def test_search_tickets_attaches_sideloaded_names():
 @pytest.mark.asyncio
 async def test_search_tickets_sort_and_cursor_params():
     client = FakeZendeskClient({"/search.json": {"results": []}})
-    await search.search_tickets(client, "billing", sort_by="created_at", sort_order="asc", cursor="abc")
+    await search.search_tickets(client, "billing", sort_by="created_at", sort_order="asc", cursor="3")
     _, _, kwargs = client.calls[0]
     assert kwargs["params"]["sort_by"] == "created_at"
     assert kwargs["params"]["sort_order"] == "asc"
-    assert kwargs["params"]["page[after]"] == "abc"
+    assert kwargs["params"]["page"] == 3
 
 
 @pytest.mark.asyncio
@@ -334,7 +354,22 @@ async def test_search_tickets_respects_limit():
     client = FakeZendeskClient({"/search.json": {"results": []}})
     await search.search_tickets(client, "billing", limit=10)
     _, _, kwargs = client.calls[0]
-    assert kwargs["params"]["page[size]"] == 10
+    assert kwargs["params"]["per_page"] == 10
+
+
+@pytest.mark.asyncio
+async def test_search_tickets_uses_offset_pagination_not_cursor_style():
+    client = FakeZendeskClient({"/search.json": {"results": [], "next_page": "https://x/search.json?page=2"}})
+    result = await search.search_tickets(client, "billing")
+    _, _, kwargs = client.calls[0]
+    assert "page[size]" not in kwargs["params"]
+    assert "page[after]" not in kwargs["params"]
+    assert result["next_cursor"] == "2"
+
+
+def test_offset_page_params_rejects_invalid_cursor():
+    with pytest.raises(ValueError, match="Invalid cursor"):
+        fields.offset_page_params("not-a-number", limit=25)
 
 
 @pytest.mark.asyncio
@@ -437,7 +472,7 @@ async def test_list_tickets_with_numeric_group_skips_resolution():
             {
                 "params": {
                     "include": "users,groups,organizations",
-                    "page[size]": 25,
+                    "per_page": 25,
                     "query": "type:ticket group:7",
                 }
             },
@@ -622,6 +657,39 @@ async def test_list_guide_categories_nests_sections():
         ],
         "has_more": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_paginates_through_all_sections():
+    client = FakeZendeskClient(
+        {
+            "/help_center/sections.json": [
+                {"sections": [{"id": 1, "name": "Page1", "category_id": 200}], "next_page": "https://x/sections.json?page=2"},
+                {"sections": [{"id": 2, "name": "Page2", "category_id": 200}], "next_page": None},
+            ],
+            "/help_center/categories.json": {"categories": [{"id": 200, "name": "Cat"}]},
+        }
+    )
+    result = await guides.list_guide_categories(client)
+    assert result["has_more"] is False
+    section_ids = {s["id"] for s in result["categories"][0]["sections"]}
+    assert section_ids == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_paginate_all_stops_at_max_pages():
+    client = FakeZendeskClient(
+        {
+            "/x.json": [
+                {"items": [{"id": 1}], "next_page": "https://x/x.json?page=2"},
+                {"items": [{"id": 2}], "next_page": "https://x/x.json?page=3"},
+                {"items": [{"id": 3}], "next_page": "https://x/x.json?page=4"},
+            ],
+        }
+    )
+    items, truncated = await guides._paginate_all(client, "/x.json", "items", max_pages=2)
+    assert len(items) == 2
+    assert truncated is True
 
 
 @pytest.mark.asyncio

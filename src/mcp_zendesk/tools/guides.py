@@ -92,21 +92,35 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", title.lower())
 
 
-async def _taxonomy(client: ZendeskClient) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], bool]:
-    """Fetch id->object maps for sections and categories (first page only), for resolving
-    section_id/category_id to human-readable names.
+async def _paginate_all(client: ZendeskClient, path: str, list_key: str, max_pages: int = 20) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch every page of an offset-paginated Help Center list endpoint, up to max_pages.
+    Returns (items, truncated) — truncated is True only if max_pages was hit before next_page
+    went null.
 
-    ponytail: first page only (100 sections/categories); above that a name resolves to None
-    and the caller's has_more reflects the cutoff — paginate if a Help Center ever exceeds this.
+    ponytail: 20-page (2000-item) ceiling, not unbounded; raise max_pages if a Help Center ever
+    gets meaningfully bigger than that.
     """
-    sections_data, categories_data = await asyncio.gather(
-        client.get("/help_center/sections.json", params={"per_page": 100}),
-        client.get("/help_center/categories.json", params={"per_page": 100}),
+    items: list[dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        data = await client.get(path, params={"per_page": 100, "page": page})
+        items.extend(data.get(list_key, []))
+        if not data.get("next_page"):
+            return items, False
+    return items, True
+
+
+async def _taxonomy(client: ZendeskClient) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], bool]:
+    """Fetch id->object maps for all sections and categories, for resolving section_id/
+    category_id to human-readable names."""
+    (sections, sections_truncated), (categories, categories_truncated) = await asyncio.gather(
+        _paginate_all(client, "/help_center/sections.json", "sections"),
+        _paginate_all(client, "/help_center/categories.json", "categories"),
     )
-    sections = {s["id"]: s for s in sections_data.get("sections", [])}
-    categories = {c["id"]: c for c in categories_data.get("categories", [])}
-    truncated = bool(sections_data.get("next_page")) or bool(categories_data.get("next_page"))
-    return sections, categories, truncated
+    return (
+        {s["id"]: s for s in sections},
+        {c["id"]: c for c in categories},
+        sections_truncated or categories_truncated,
+    )
 
 
 def _snippet(article: dict[str, Any]) -> str:
@@ -150,11 +164,12 @@ async def search_guides(
     page: int = 1,
     locale: str | None = None,
 ) -> dict[str, Any]:
-    """Search Help Center articles by keyword. Returns a short snippet per article (never the
-    full body) — call get_guide for an article whose snippet looks relevant. Results are
-    deduplicated across translations and near-duplicate section/title matches, then capped at
-    limit (default 5, keep it low). Help Center paging is offset-based: pass page=2 when
-    has_more is true."""
+    """Search Help Center articles (knowledge-base documentation/how-to content) by keyword —
+    not support tickets; use search_tickets for a customer's actual conversation/request
+    history. Returns a short snippet per article (never the full body) — call get_guide for an
+    article whose snippet looks relevant. Results are deduplicated across translations and
+    near-duplicate section/title matches, then capped at limit (default 5, keep it low). Help
+    Center paging is offset-based: pass page=2 when has_more is true."""
     per_page = min(max(limit * 3, 10), 100)
     params: dict[str, Any] = {"query": query, "per_page": per_page, "page": page}
     if locale:
@@ -215,9 +230,10 @@ async def search_guides(
 
 
 async def get_guide(client: ZendeskClient, article_id: int) -> dict[str, Any]:
-    """Get the full content of a single Help Center article, with its HTML body converted to
-    readable text (truncated at ~8000 characters, flagged via truncated). If the article is
-    restricted, raises a clear error naming the article instead of a generic credentials error."""
+    """Get the full content of a single Help Center article (knowledge-base documentation) by
+    ID — not a support ticket; use get_ticket for that. HTML body is converted to readable text
+    (truncated at ~8000 characters, flagged via truncated). If the article is restricted, raises
+    a clear error naming the article instead of a generic credentials error."""
     async def fetch_article() -> dict[str, Any]:
         try:
             return await client.get(f"/help_center/articles/{article_id}.json")
@@ -248,8 +264,9 @@ async def get_guide(client: ZendeskClient, article_id: int) -> dict[str, Any]:
 
 
 async def list_guide_categories(client: ZendeskClient) -> dict[str, Any]:
-    """List Help Center categories with their sections nested inside, for exploratory
-    navigation."""
+    """List Help Center categories (knowledge-base documentation, not support tickets — use
+    list_tickets/search_tickets for actual customer conversations) with their sections nested
+    inside, for exploratory navigation."""
     sections, categories, truncated = await _taxonomy(client)
     grouped: dict[int, list[dict[str, Any]]] = {}
     for section in sections.values():
@@ -273,12 +290,13 @@ async def create_guide(
     draft: bool,
     locale: str = "pt-br",
 ) -> dict[str, Any]:
-    """Create a Help Center article. Specify draft explicitly: True creates an unpublished
-    draft, False publishes it immediately to the Help Center — decide based on what the user
-    asked, never default to one or the other. visibility is "everyone" for a publicly visible
-    article, or a user segment name/ID to restrict it. section and permission_group accept a
-    name or a numeric ID; call list_guide_permissions to discover valid values. body should be
-    HTML; plain text is wrapped in paragraphs automatically."""
+    """Create a Help Center article (knowledge-base documentation) — not a support ticket; use
+    create_ticket for a customer request instead. Specify draft explicitly: True creates an
+    unpublished draft, False publishes it immediately to the Help Center — decide based on what
+    the user asked, never default to one or the other. visibility is "everyone" for a publicly
+    visible article, or a user segment name/ID to restrict it. section and permission_group
+    accept a name or a numeric ID; call list_guide_permissions to discover valid values. body
+    should be HTML; plain text is wrapped in paragraphs automatically."""
     sections, _categories, _truncated = await _taxonomy(client)
     section_id = _resolve_ref(list(sections.values()), section, "section")
 
@@ -324,9 +342,10 @@ async def update_guide(
     draft: bool | None = None,
     locale: str = "pt-br",
 ) -> dict[str, Any]:
-    """Update an existing Help Center article's title, body, or draft status. Editing content
-    goes through the article's translation for locale (Zendesk does not update title/body via
-    the article endpoint directly). Provide at least one of title, body, or draft.
+    """Update an existing Help Center article's title, body, or draft status — not a support
+    ticket; use update_ticket for that. Editing content goes through the article's translation
+    for locale (Zendesk does not update title/body via the article endpoint directly). Provide
+    at least one of title, body, or draft.
 
     draft defaults to None (leave publication state unchanged), unlike create_guide's required
     draft: there's no prior state to decide on when creating, but omitting it here is a safe

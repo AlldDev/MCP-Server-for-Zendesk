@@ -64,6 +64,20 @@ async def test_403_raises_with_status_and_distinct_message():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_400_surfaces_response_body():
+    mock_oauth_token()
+    respx.get(f"{BASE_URL}/search.json").mock(
+        return_value=httpx.Response(400, json={"error": {"title": "Invalid attribute", "message": "page must be an integer"}})
+    )
+    client = make_client()
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await client.get("/search.json")
+    assert exc_info.value.status == 400
+    assert "page must be an integer" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_404_raises():
     mock_oauth_token()
     respx.get(f"{BASE_URL}/tickets/999.json").mock(return_value=httpx.Response(404, json={}))

@@ -9,6 +9,8 @@ from mcp_zendesk.tools.fields import (
     TICKET_DETAIL_FIELDS,
     build_name_maps,
     enrich_ticket,
+    offset_next_cursor,
+    offset_page_params,
     project,
     truncate,
 )
@@ -44,14 +46,13 @@ async def list_tickets(
     cursor: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """List Zendesk tickets, optionally filtered by status, priority, requester email, or group
-    (accepts a group name or ID; names are resolved via the groups list). sort_by accepts
-    "updated_at", "created_at", "priority", "status", or "ticket_type" (only applies when a
-    filter is given); sort_order is "asc" or "desc". Returns up to limit tickets (default 25,
-    keep it low); pass the previous call's next_cursor to fetch more."""
-    params: dict[str, Any] = {"include": "users,groups,organizations", "page[size]": max(1, min(limit, 100))}
-    if cursor:
-        params["page[after]"] = cursor
+    """List Zendesk Support tickets (customer conversations/requests) — not Help Center articles;
+    use list_guide_categories/search_guides to browse or find documentation instead. Optionally
+    filtered by status, priority, requester email, or group (accepts a group name or ID; names
+    are resolved via the groups list). sort_by accepts "updated_at", "created_at", "priority",
+    "status", or "ticket_type" (only applies when a filter is given); sort_order is "asc" or
+    "desc". Returns up to limit tickets (default 25, keep it low); pass the previous call's
+    next_cursor to fetch more."""
     if status or priority or requester_email or group:
         query_parts = ["type:ticket"]
         if status:
@@ -63,27 +64,37 @@ async def list_tickets(
         if group:
             group_id = int(group) if group.isdigit() else await resolve_group_id(client, group)
             query_parts.append(f"group:{group_id}")
-        params["query"] = " ".join(query_parts)
+        params: dict[str, Any] = {
+            "include": "users,groups,organizations",
+            "query": " ".join(query_parts),
+            **offset_page_params(cursor, limit),
+        }
         if sort_by:
             params["sort_by"] = sort_by
         if sort_order:
             params["sort_order"] = sort_order
         data = await client.get("/search.json", params=params)
         tickets = data.get("results", [])
+        next_cursor = offset_next_cursor(cursor, bool(data.get("next_page")))
     else:
+        params = {"include": "users,groups,organizations", "page[size]": max(1, min(limit, 100))}
+        if cursor:
+            params["page[after]"] = cursor
         data = await client.get("/tickets.json", params=params)
         tickets = data.get("tickets", [])
+        meta = data.get("meta", {})
+        next_cursor = meta.get("after_cursor") if meta.get("has_more") else None
     names = build_name_maps(data)
-    meta = data.get("meta", {})
     return {
         "count": len(tickets),
         "tickets": [enrich_ticket(t, names) for t in tickets],
-        "next_cursor": meta.get("after_cursor") if meta.get("has_more") else None,
+        "next_cursor": next_cursor,
     }
 
 
 async def get_ticket(client: ZendeskClient, ticket_id: int) -> dict[str, Any]:
-    """Get full details for a single Zendesk ticket by ID."""
+    """Get full details for a single Zendesk Support ticket (a customer conversation/request)
+    by ID — not a Help Center article; use get_guide for that."""
     data = await client.get(f"/tickets/{ticket_id}.json")
     return _project_ticket_detail(data["ticket"])
 
@@ -97,7 +108,8 @@ async def create_ticket(
     tags: list[str] | None = None,
     custom_fields: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create a new Zendesk ticket.
+    """Create a new Zendesk Support ticket (a customer conversation/request) — not a Help Center
+    article; use create_guide to publish documentation instead.
 
     custom_fields, if given, is a list of {"id": <field_id>, "value": <value>}
     (Zendesk's own format), since custom fields vary per account (spec section 11).
@@ -123,7 +135,8 @@ async def update_ticket(
     assignee_email: str | None = None,
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Update a ticket's status, priority, assignee, or tags."""
+    """Update a Zendesk Support ticket's status, priority, assignee, or tags — not a Help Center
+    article; use update_guide for that."""
     fields: dict[str, Any] = {}
     if status:
         fields["status"] = status
