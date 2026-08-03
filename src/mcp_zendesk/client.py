@@ -80,6 +80,7 @@ class ZendeskClient:
             base_url=f"https://{subdomain}.zendesk.com/api/v2",
             timeout=30.0,
         )
+        self._token: str | None = None
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
         self._cache = _TTLCache(cache_ttl_seconds, _clock) if cache_ttl_seconds > 0 else None
@@ -97,6 +98,11 @@ class ZendeskClient:
         No refresh_token is issued for this grant type; expiry just means asking for a
         new one. Lock is unconditional (not double-checked) since asyncio has no thread
         contention to avoid and the check itself is cheap.
+
+        The token is kept here and attached per-request (see `request`) instead of on
+        `self._client.headers`: this POST must go out *without* an Authorization header,
+        since Zendesk 401s the token endpoint if it carries the expired bearer token —
+        which used to make every renewal fail while the first fetch succeeded.
         """
         async with self._token_lock:
             if not force and self._clock() < self._token_expires_at:
@@ -112,15 +118,25 @@ class ZendeskClient:
                 },
             )
             token = self._parse(response)
-            self._client.headers["Authorization"] = f"Bearer {token['access_token']}"
-            self._token_expires_at = self._clock() + token["expires_in"] - 30
+            try:
+                self._token = token["access_token"]
+                # expires_in is absent for OAuth clients without token expiry configured.
+                expires_in = float(token.get("expires_in", 3600))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ZendeskAPIError("Zendesk returned an unusable OAuth token response.") from exc
+            self._token_expires_at = self._clock() + expires_in - 30
+            logger.info("Fetched Zendesk OAuth token (expires_in=%.0fs)", expires_in)
+
+    def _authed(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """kwargs with the current bearer token merged in, without mutating the original."""
+        return {**kwargs, "headers": {**kwargs.get("headers", {}), "Authorization": f"Bearer {self._token}"}}
 
     async def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         await self._ensure_token()
-        response = await self._send_with_retry(method, path, **kwargs)
+        response = await self._send_with_retry(method, path, **self._authed(kwargs))
         if response.status_code == 401:
             await self._ensure_token(force=True)
-            response = await self._send_with_retry(method, path, **kwargs)
+            response = await self._send_with_retry(method, path, **self._authed(kwargs))
         return self._parse(response)
 
     async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:

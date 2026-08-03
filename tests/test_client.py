@@ -208,7 +208,11 @@ async def test_oauth_token_refreshed_after_expiry():
 @pytest.mark.asyncio
 @respx.mock
 async def test_401_forces_token_refresh_and_retries():
-    token_route = mock_oauth_token()
+    token_route = respx.post(TOKEN_URL)
+    token_route.side_effect = [
+        httpx.Response(201, json={"access_token": "tok-1", "token_type": "bearer", "expires_in": 3600}),
+        httpx.Response(201, json={"access_token": "tok-2", "token_type": "bearer", "expires_in": 3600}),
+    ]
     resource_route = respx.get(f"{BASE_URL}/tickets/1.json")
     resource_route.side_effect = [
         httpx.Response(401, json={}),
@@ -219,6 +223,32 @@ async def test_401_forces_token_refresh_and_retries():
     assert data == {"ticket": {"id": 1}}
     assert resource_route.call_count == 2
     assert token_route.call_count == 2
+    assert resource_route.calls[1].request.headers["Authorization"] == "Bearer tok-2"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_token_refresh_does_not_send_the_expired_bearer_token():
+    """Zendesk 401s /oauth/tokens if the request carries a stale Authorization header,
+    which would break every renewal while the very first fetch still worked."""
+    issued = iter(["tok-1", "tok-2"])
+
+    def issue_token(request: httpx.Request) -> httpx.Response:
+        if "Authorization" in request.headers:
+            return httpx.Response(401, json={"error": "Couldn't authenticate you"})
+        return httpx.Response(201, json={"access_token": next(issued), "token_type": "bearer", "expires_in": 100})
+
+    token_route = respx.post(TOKEN_URL).mock(side_effect=issue_token)
+    resource_route = respx.get(f"{BASE_URL}/tickets/1.json").mock(
+        return_value=httpx.Response(200, json={"ticket": {"id": 1}})
+    )
+    fake_time = [0.0]
+    client = make_client(cache_ttl_seconds=0, clock=lambda: fake_time[0])
+    await client.get("/tickets/1.json")
+    fake_time[0] = 71.0  # past expires_in(100) - 30s early-refresh margin
+    assert await client.get("/tickets/1.json") == {"ticket": {"id": 1}}
+    assert token_route.call_count == 2
+    assert resource_route.calls[1].request.headers["Authorization"] == "Bearer tok-2"
 
 
 @pytest.mark.asyncio

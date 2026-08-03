@@ -41,7 +41,9 @@ Request flow: `BearerAuthMiddleware` (auth.py) wraps the whole ASGI app → MCP'
   `tests/test_tools.py` exercises directly against a `FakeZendeskClient` (no real HTTP/respx needed there).
 - **`client.py`** (`ZendeskClient`) is the only thing that talks to Zendesk. It owns three concerns at
   once: OAuth `client_credentials` token lifecycle (auto-fetch, early refresh ~30s before expiry, forced
-  refresh + single retry on a live 401), 429 retry with exponential backoff / `Retry-After` (`MAX_ATTEMPTS
+  refresh + single retry on a live 401 — the token lives in `self._token` and is attached per-request,
+  never on `self._client.headers`, so the `/oauth/tokens` POST goes out with no `Authorization` header;
+  Zendesk 401s the token endpoint if it carries the expired bearer token), 429 retry with exponential backoff / `Retry-After` (`MAX_ATTEMPTS
   = 3`), and a tiny whole-cache-invalidating TTL cache for GETs (`get`/`post`/`put` are the only entry
   points tools should use — `post`/`put` both call `invalidate_cache()` unconditionally). `_parse` is the
   single place HTTP status codes become `ZendeskAPIError` — never let a raw `httpx.Response` or exception
