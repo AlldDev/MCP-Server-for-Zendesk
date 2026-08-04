@@ -19,7 +19,8 @@ async def search_tickets(
     documentation; use search_guides for how-to/reference content. sort_by accepts "updated_at",
     "created_at", "priority", "status", or "ticket_type"; sort_order is "asc" or "desc". Returns
     up to limit results (default 25, keep it low); pass the previous call's next_cursor to fetch
-    more."""
+    more. total_matches is how many tickets match the query in Zendesk — if it is much larger
+    than limit, narrow the query instead of paging."""
     scoped_query = query if "type:" in query else f"type:ticket {query}"
     params: dict[str, Any] = {
         "query": scoped_query,
@@ -35,6 +36,7 @@ async def search_tickets(
     names = build_name_maps(data)
     return {
         "count": len(results),
+        "total_matches": data.get("count"),
         "tickets": [enrich_ticket(t, names) for t in results],
         "next_cursor": offset_next_cursor(cursor, bool(data.get("next_page"))),
     }

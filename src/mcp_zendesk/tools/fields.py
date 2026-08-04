@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp_zendesk.client import ZendeskClient
+
 TICKET_SUMMARY_FIELDS = {
     "id", "subject", "status", "priority",
     "requester_id", "assignee_id", "group_id", "organization_id",
@@ -56,6 +58,26 @@ def offset_next_cursor(cursor: str | None, has_more: bool) -> str | None:
     if not has_more:
         return None
     return str((int(cursor) if cursor else 1) + 1)
+
+
+async def paginate_all(
+    client: ZendeskClient, path: str, list_key: str, max_pages: int = 20
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch every page of an offset-paginated Zendesk list endpoint, up to max_pages.
+    Returns (items, truncated) — truncated is True only if max_pages was hit before next_page
+    went null. For small reference lists (groups, permission groups, ticket fields, Help Center
+    taxonomy) where a silent first-page cut would make the model believe it saw everything.
+
+    ponytail: 20-page (2000-item) ceiling, not unbounded; raise max_pages if a list ever gets
+    meaningfully bigger than that.
+    """
+    items: list[dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        data = await client.get(path, params={"per_page": 100, "page": page})
+        items.extend(data.get(list_key, []))
+        if not data.get("next_page"):
+            return items, False
+    return items, True
 
 
 def build_name_maps(data: dict[str, Any]) -> dict[str, dict[int, str]]:

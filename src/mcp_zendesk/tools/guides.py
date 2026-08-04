@@ -12,6 +12,7 @@ from mcp_zendesk.tools.fields import (
     ARTICLE_WRITE_FIELDS,
     GUIDE_REF_FIELDS,
     TRANSLATION_FIELDS,
+    paginate_all,
     project,
     project_list,
     truncate,
@@ -92,35 +93,37 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", title.lower())
 
 
-async def _paginate_all(client: ZendeskClient, path: str, list_key: str, max_pages: int = 20) -> tuple[list[dict[str, Any]], bool]:
-    """Fetch every page of an offset-paginated Help Center list endpoint, up to max_pages.
-    Returns (items, truncated) — truncated is True only if max_pages was hit before next_page
-    went null.
-
-    ponytail: 20-page (2000-item) ceiling, not unbounded; raise max_pages if a Help Center ever
-    gets meaningfully bigger than that.
-    """
-    items: list[dict[str, Any]] = []
-    for page in range(1, max_pages + 1):
-        data = await client.get(path, params={"per_page": 100, "page": page})
-        items.extend(data.get(list_key, []))
-        if not data.get("next_page"):
-            return items, False
-    return items, True
-
-
 async def _taxonomy(client: ZendeskClient) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]], bool]:
-    """Fetch id->object maps for all sections and categories, for resolving section_id/
-    category_id to human-readable names."""
+    """Fetch id->object maps for all sections and categories. Only for callers that genuinely
+    need the whole tree (list_guide_categories, and create_guide's name lookup) — to put a name
+    on a handful of known section_ids, use _sections_by_id instead: this walks every page of
+    both endpoints."""
     (sections, sections_truncated), (categories, categories_truncated) = await asyncio.gather(
-        _paginate_all(client, "/help_center/sections.json", "sections"),
-        _paginate_all(client, "/help_center/categories.json", "categories"),
+        paginate_all(client, "/help_center/sections.json", "sections"),
+        paginate_all(client, "/help_center/categories.json", "categories"),
     )
     return (
         {s["id"]: s for s in sections},
         {c["id"]: c for c in categories},
         sections_truncated or categories_truncated,
     )
+
+
+async def _fetch_ref(client: ZendeskClient, path: str, key: str) -> dict[str, Any] | None:
+    """Fetch one Help Center object, returning None if it is missing or restricted — a section
+    we can't name is not a reason to fail the caller's read."""
+    try:
+        return (await client.get(path)).get(key)
+    except ZendeskAPIError:
+        return None
+
+
+async def _sections_by_id(client: ZendeskClient, section_ids: set[int]) -> dict[int, dict[str, Any]]:
+    """id->section map for just the sections asked for, fetched concurrently."""
+    fetched = await asyncio.gather(
+        *(_fetch_ref(client, f"/help_center/sections/{i}.json", "section") for i in section_ids)
+    )
+    return {s["id"]: s for s in fetched if s}
 
 
 def _snippet(article: dict[str, Any]) -> str:
@@ -168,15 +171,16 @@ async def search_guides(
     not support tickets; use search_tickets for a customer's actual conversation/request
     history. Returns a short snippet per article (never the full body) — call get_guide for an
     article whose snippet looks relevant. Results are deduplicated across translations and
-    near-duplicate section/title matches, then capped at limit (default 5, keep it low). Help
-    Center paging is offset-based: pass page=2 when has_more is true."""
+    near-duplicate section/title matches, then capped at limit (default 5, keep it low).
+    total_matches is how many articles match in Zendesk — if it is much larger than limit,
+    use more specific keywords instead of paging. Help Center paging is offset-based: pass
+    page=2 when has_more is true."""
     per_page = min(max(limit * 3, 10), 100)
     params: dict[str, Any] = {"query": query, "per_page": per_page, "page": page}
     if locale:
         params["locale"] = locale
     data = await client.get("/help_center/articles/search.json", params=params)
     results = data.get("results", [])
-    sections, _categories, _truncated_taxonomy = await _taxonomy(client)
 
     by_id: dict[int, dict[str, Any]] = {}
     for index, article in enumerate(results):
@@ -213,6 +217,11 @@ async def search_guides(
     ranked = sorted(by_section_title.values(), key=lambda e: (tier(e), e["index"]))
     trimmed = ranked[:limit]
 
+    # Name the sections only for the results that survived, not the whole Help Center.
+    sections = await _sections_by_id(
+        client, {sid for e in trimmed if (sid := e["article"].get("section_id")) is not None}
+    )
+
     articles = []
     for entry in trimmed:
         article = entry["article"]
@@ -226,7 +235,12 @@ async def search_guides(
                 "url": article.get("html_url"),
             }
         )
-    return {"count": len(articles), "articles": articles, "has_more": bool(data.get("next_page"))}
+    return {
+        "count": len(articles),
+        "total_matches": data.get("count"),
+        "articles": articles,
+        "has_more": bool(data.get("next_page")),
+    }
 
 
 async def get_guide(client: ZendeskClient, article_id: int) -> dict[str, Any]:
@@ -234,22 +248,33 @@ async def get_guide(client: ZendeskClient, article_id: int) -> dict[str, Any]:
     ID — not a support ticket; use get_ticket for that. HTML body is converted to readable text
     (truncated at ~8000 characters, flagged via truncated). If the article is restricted, raises
     a clear error naming the article instead of a generic credentials error."""
-    async def fetch_article() -> dict[str, Any]:
-        try:
-            return await client.get(f"/help_center/articles/{article_id}.json")
-        except ZendeskAPIError as exc:
-            if exc.status == 403:
-                raise ZendeskAPIError(
-                    f"Article {article_id} is restricted and the configured credentials do not have "
-                    "permission to read it.",
-                    status=403,
-                ) from exc
-            raise
+    try:
+        # include= sideloads the section and category in the same response, so naming them
+        # costs no extra request. Falls back to a targeted fetch if they don't come back.
+        data = await client.get(
+            f"/help_center/articles/{article_id}.json", params={"include": "sections,categories"}
+        )
+    except ZendeskAPIError as exc:
+        if exc.status == 403:
+            raise ZendeskAPIError(
+                f"Article {article_id} is restricted and the configured credentials do not have "
+                "permission to read it.",
+                status=403,
+            ) from exc
+        raise
 
-    data, (sections, categories, _truncated_taxonomy) = await asyncio.gather(fetch_article(), _taxonomy(client))
     article = data["article"]
-    section = sections.get(article.get("section_id"))
-    category = categories.get(section.get("category_id")) if section else None
+    section_id = article.get("section_id")
+    section = {s["id"]: s for s in data.get("sections", [])}.get(section_id)
+    if section is None and section_id is not None:
+        section = await _fetch_ref(client, f"/help_center/sections/{section_id}.json", "section")
+
+    category = None
+    if section and (category_id := section.get("category_id")) is not None:
+        category = {c["id"]: c for c in data.get("categories", [])}.get(category_id)
+        if category is None:
+            category = await _fetch_ref(client, f"/help_center/categories/{category_id}.json", "category")
+
     body, body_truncated = truncate(_html_to_text(article.get("body") or ""), MAX_BODY_CHARS)
 
     out = project(article, ARTICLE_DETAIL_FIELDS)
@@ -303,18 +328,18 @@ async def create_guide(
     if permission_group.isdigit():
         permission_group_id = int(permission_group)
     else:
-        permission_data = await client.get("/guide/permission_groups.json")
-        permission_group_id = _resolve_ref(
-            permission_data.get("permission_groups", []), permission_group, "permission group"
+        permissions, _truncated = await paginate_all(
+            client, "/guide/permission_groups.json", "permission_groups"
         )
+        permission_group_id = _resolve_ref(permissions, permission_group, "permission group")
 
     if visibility.strip().lower() == "everyone":
         user_segment_id = None
     elif visibility.isdigit():
         user_segment_id = int(visibility)
     else:
-        segment_data = await client.get("/help_center/user_segments.json")
-        user_segment_id = _resolve_ref(segment_data.get("user_segments", []), visibility, "user segment")
+        segments, _truncated = await paginate_all(client, "/help_center/user_segments.json", "user_segments")
+        user_segment_id = _resolve_ref(segments, visibility, "user segment")
 
     article: dict[str, Any] = {
         "title": title,
@@ -380,9 +405,9 @@ async def list_guide_permissions(client: ZendeskClient) -> dict[str, Any]:
     """List permission groups and user segments, for filling create_guide's permission_group
     and visibility parameters. "everyone" is also accepted as visibility without needing a
     segment from this list."""
-    async def fetch_permissions() -> dict[str, Any]:
+    async def fetch_permissions() -> tuple[list[dict[str, Any]], bool]:
         try:
-            return await client.get("/guide/permission_groups.json")
+            return await paginate_all(client, "/guide/permission_groups.json", "permission_groups")
         except ZendeskAPIError as exc:
             if exc.status == 403:
                 raise ZendeskAPIError(
@@ -393,10 +418,11 @@ async def list_guide_permissions(client: ZendeskClient) -> dict[str, Any]:
                 ) from exc
             raise
 
-    segment_data, permission_data = await asyncio.gather(
-        client.get("/help_center/user_segments.json"), fetch_permissions()
+    (segments, segments_truncated), (permissions, permissions_truncated) = await asyncio.gather(
+        paginate_all(client, "/help_center/user_segments.json", "user_segments"), fetch_permissions()
     )
     return {
-        "permission_groups": project_list(permission_data.get("permission_groups", []), GUIDE_REF_FIELDS),
-        "user_segments": project_list(segment_data.get("user_segments", []), GUIDE_REF_FIELDS),
+        "permission_groups": project_list(permissions, GUIDE_REF_FIELDS),
+        "user_segments": project_list(segments, GUIDE_REF_FIELDS),
+        "has_more": segments_truncated or permissions_truncated,
     }

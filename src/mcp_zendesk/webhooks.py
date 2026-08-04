@@ -24,7 +24,7 @@ def _verify_signature(secret: str, timestamp: str, body: bytes, signature: str) 
 
 def create_webhook_route(client: ZendeskClient, secret: str) -> Route:
     """Zendesk webhook receiver: verifies the signature, then invalidates the read
-    cache so ticket events are reflected on the next read (spec section 9, Fase 4)."""
+    cache so ticket events are reflected on the next read."""
 
     async def handle(request: Request) -> Response:
         body = await request.body()

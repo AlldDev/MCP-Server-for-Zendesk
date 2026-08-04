@@ -11,6 +11,7 @@ from mcp_zendesk.tools.fields import (
     enrich_ticket,
     offset_next_cursor,
     offset_page_params,
+    paginate_all,
     project,
     truncate,
 )
@@ -35,6 +36,26 @@ def _project_ticket_detail(ticket: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+async def _field_titles(client: ZendeskClient) -> dict[int, str]:
+    """id->title map for the account's ticket fields."""
+    ticket_fields, _truncated = await paginate_all(client, "/ticket_fields.json", "ticket_fields")
+    return {f["id"]: f.get("title") for f in ticket_fields}
+
+
+async def _ticket_detail(client: ZendeskClient, ticket: dict[str, Any]) -> dict[str, Any]:
+    """_project_ticket_detail plus a name on each custom field — a bare {"id": 360012345,
+    "value": ...} is unreadable, so the model can't tell which fields matter. Only fetches
+    /ticket_fields.json when the ticket actually has custom fields set, and that GET is cached
+    by ZendeskClient, so it costs ~one real call per cache window rather than one per ticket."""
+    out = _project_ticket_detail(ticket)
+    if custom_fields := out.get("custom_fields"):
+        titles = await _field_titles(client)
+        out["custom_fields"] = [
+            {"id": f["id"], "name": titles.get(f["id"]), "value": f["value"]} for f in custom_fields
+        ]
+    return out
+
+
 async def list_tickets(
     client: ZendeskClient,
     status: TicketStatus | None = None,
@@ -52,7 +73,9 @@ async def list_tickets(
     are resolved via the groups list). sort_by accepts "updated_at", "created_at", "priority",
     "status", or "ticket_type" (only applies when a filter is given); sort_order is "asc" or
     "desc". Returns up to limit tickets (default 25, keep it low); pass the previous call's
-    next_cursor to fetch more."""
+    next_cursor to fetch more. total_matches is how many tickets match in Zendesk (null when
+    no filter is given) — if it is much larger than limit, narrow the filters instead of
+    paging."""
     if status or priority or requester_email or group:
         query_parts = ["type:ticket"]
         if status:
@@ -76,6 +99,8 @@ async def list_tickets(
         data = await client.get("/search.json", params=params)
         tickets = data.get("results", [])
         next_cursor = offset_next_cursor(cursor, bool(data.get("next_page")))
+        # Search reports the full number of hits; plain cursor listing does not.
+        total_matches = data.get("count")
     else:
         params = {"include": "users,groups,organizations", "page[size]": max(1, min(limit, 100))}
         if cursor:
@@ -84,9 +109,11 @@ async def list_tickets(
         tickets = data.get("tickets", [])
         meta = data.get("meta", {})
         next_cursor = meta.get("after_cursor") if meta.get("has_more") else None
+        total_matches = None
     names = build_name_maps(data)
     return {
         "count": len(tickets),
+        "total_matches": total_matches,
         "tickets": [enrich_ticket(t, names) for t in tickets],
         "next_cursor": next_cursor,
     }
@@ -96,7 +123,7 @@ async def get_ticket(client: ZendeskClient, ticket_id: int) -> dict[str, Any]:
     """Get full details for a single Zendesk Support ticket (a customer conversation/request)
     by ID — not a Help Center article; use get_guide for that."""
     data = await client.get(f"/tickets/{ticket_id}.json")
-    return _project_ticket_detail(data["ticket"])
+    return await _ticket_detail(client, data["ticket"])
 
 
 async def create_ticket(
@@ -112,7 +139,8 @@ async def create_ticket(
     article; use create_guide to publish documentation instead.
 
     custom_fields, if given, is a list of {"id": <field_id>, "value": <value>}
-    (Zendesk's own format), since custom fields vary per account (spec section 11).
+    (Zendesk's own format), since custom fields vary per account. get_ticket reports each custom
+    field's name alongside its id, which is how you find the id to write to.
     """
     ticket: dict[str, Any] = {"subject": subject, "comment": {"body": comment_body}}
     if requester_email:
@@ -124,7 +152,7 @@ async def create_ticket(
     if custom_fields:
         ticket["custom_fields"] = custom_fields
     data = await client.post("/tickets.json", json={"ticket": ticket})
-    return _project_ticket_detail(data["ticket"])
+    return await _ticket_detail(client, data["ticket"])
 
 
 async def update_ticket(
@@ -147,7 +175,7 @@ async def update_ticket(
     if tags is not None:
         fields["tags"] = tags
     data = await client.put(f"/tickets/{ticket_id}.json", json={"ticket": fields})
-    return _project_ticket_detail(data["ticket"])
+    return await _ticket_detail(client, data["ticket"])
 
 
 async def add_comment(
@@ -157,13 +185,13 @@ async def add_comment(
     public: bool,
 ) -> dict[str, Any]:
     """Add a comment to a ticket. Specify public explicitly: True for a reply visible to the
-    requester, False for an internal note (spec section 11: handle with care) — decide based
+    requester, False for an internal note (handle with care) — decide based
     on what the user asked, never default to one or the other."""
     data = await client.put(
         f"/tickets/{ticket_id}.json",
         json={"ticket": {"comment": {"body": body, "public": public}}},
     )
-    return _project_ticket_detail(data["ticket"])
+    return await _ticket_detail(client, data["ticket"])
 
 
 def _project_comment(comment: dict[str, Any]) -> dict[str, Any]:
@@ -177,13 +205,20 @@ def _project_comment(comment: dict[str, Any]) -> dict[str, Any]:
 
 
 async def get_ticket_comments(
-    client: ZendeskClient, ticket_id: int, cursor: str | None = None, limit: int = 50
+    client: ZendeskClient,
+    ticket_id: int,
+    cursor: str | None = None,
+    limit: int = 20,
+    sort_order: str | None = None,
 ) -> dict[str, Any]:
-    """Get a ticket's comment thread in chronological order. Returns up to limit comments
-    (default 50); pass the previous call's next_cursor to fetch more."""
+    """Get a ticket's comment thread, oldest first by default. Returns up to limit comments
+    (default 20); pass the previous call's next_cursor to fetch more. To read only how a long
+    thread ends, pass sort_order="desc" with a small limit instead of paging the whole thread."""
     params: dict[str, Any] = {"page[size]": max(1, min(limit, 100))}
     if cursor:
         params["page[after]"] = cursor
+    if sort_order:
+        params["sort_order"] = sort_order
     data = await client.get(f"/tickets/{ticket_id}/comments.json", params=params)
     comments = data.get("comments", [])
     meta = data.get("meta", {})
@@ -194,8 +229,11 @@ async def get_ticket_comments(
     }
 
 
-def _change_events(audit: dict[str, Any]) -> list[dict[str, Any]]:
-    return [e for e in audit.get("events", []) if e.get("type") == "Change"]
+def _change_events(audit: dict[str, Any], field_name: str | None = None) -> list[dict[str, Any]]:
+    events = [e for e in audit.get("events", []) if e.get("type") == "Change"]
+    if field_name:
+        events = [e for e in events if e.get("field_name") == field_name]
+    return events
 
 
 def _truncate_audit_value(value: Any) -> Any:
@@ -205,7 +243,7 @@ def _truncate_audit_value(value: Any) -> Any:
     return value
 
 
-def _simplify_audit(audit: dict[str, Any]) -> dict[str, Any]:
+def _simplify_audit(audit: dict[str, Any], field_name: str | None = None) -> dict[str, Any]:
     return {
         "id": audit["id"],
         "author_id": audit.get("author_id"),
@@ -216,25 +254,31 @@ def _simplify_audit(audit: dict[str, Any]) -> dict[str, Any]:
                 "previous_value": _truncate_audit_value(e.get("previous_value")),
                 "value": _truncate_audit_value(e.get("value")),
             }
-            for e in _change_events(audit)
+            for e in _change_events(audit, field_name)
         ],
     }
 
 
 async def get_ticket_audits(
-    client: ZendeskClient, ticket_id: int, cursor: str | None = None, limit: int = 50
+    client: ZendeskClient,
+    ticket_id: int,
+    cursor: str | None = None,
+    limit: int = 50,
+    field_name: str | None = None,
 ) -> dict[str, Any]:
     """Get a ticket's change history (who changed what field and when). Comment-only audits
-    are omitted; use get_ticket_comments for the conversation itself. Returns up to limit
-    audits (default 50); pass the previous call's next_cursor to fetch more."""
+    are omitted; use get_ticket_comments for the conversation itself. Pass field_name (e.g.
+    "status", "assignee_id", "priority") to get only that field's changes instead of the whole
+    history. Returns up to limit audits (default 50) — count is after filtering, so it can be
+    0 with a non-null next_cursor; pass the previous call's next_cursor to fetch more."""
     params: dict[str, Any] = {"page[size]": max(1, min(limit, 100))}
     if cursor:
         params["page[after]"] = cursor
     data = await client.get(f"/tickets/{ticket_id}/audits.json", params=params)
-    audits = [a for a in data.get("audits", []) if _change_events(a)]
+    audits = [a for a in data.get("audits", []) if _change_events(a, field_name)]
     meta = data.get("meta", {})
     return {
         "count": len(audits),
-        "audits": [_simplify_audit(a) for a in audits],
+        "audits": [_simplify_audit(a, field_name) for a in audits],
         "next_cursor": meta.get("after_cursor") if meta.get("has_more") else None,
     }

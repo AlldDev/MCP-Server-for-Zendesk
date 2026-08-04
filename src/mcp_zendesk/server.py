@@ -53,7 +53,9 @@ async def list_tickets(
     organization_name when that Zendesk object is known. sort_by accepts "updated_at",
     "created_at", "priority", "status", or "ticket_type" (only applies when a filter is given);
     sort_order is "asc" or "desc". Returns up to limit tickets (default 25, keep it low); pass
-    the previous call's next_cursor to fetch more."""
+    the previous call's next_cursor to fetch more. total_matches is how many tickets match in
+    Zendesk (null when no filter is given) — if it is much larger than limit, narrow the filters
+    instead of paging."""
     return await tickets.list_tickets(
         zendesk,
         status=status,
@@ -70,7 +72,8 @@ async def list_tickets(
 @mcp.tool()
 async def get_ticket(ticket_id: int) -> dict[str, Any]:
     """Get full details for a single Zendesk Support ticket (a customer conversation/request)
-    by ID — not a Help Center article; use get_guide for that."""
+    by ID — not a Help Center article; use get_guide for that. Custom fields come back with the
+    field's name alongside its id and value."""
     return await tickets.get_ticket(zendesk, ticket_id)
 
 
@@ -121,18 +124,29 @@ async def add_comment(ticket_id: int, body: str, public: bool) -> dict[str, Any]
 
 
 @mcp.tool()
-async def get_ticket_comments(ticket_id: int, cursor: str | None = None, limit: int = 50) -> dict[str, Any]:
-    """Get a ticket's comment thread in chronological order. Returns up to limit comments
-    (default 50); pass the previous call's next_cursor to fetch more."""
-    return await tickets.get_ticket_comments(zendesk, ticket_id, cursor=cursor, limit=limit)
+async def get_ticket_comments(
+    ticket_id: int, cursor: str | None = None, limit: int = 20, sort_order: str | None = None
+) -> dict[str, Any]:
+    """Get a ticket's comment thread, oldest first by default. Returns up to limit comments
+    (default 20); pass the previous call's next_cursor to fetch more. To read only how a long
+    thread ends, pass sort_order="desc" with a small limit instead of paging the whole thread."""
+    return await tickets.get_ticket_comments(
+        zendesk, ticket_id, cursor=cursor, limit=limit, sort_order=sort_order
+    )
 
 
 @mcp.tool()
-async def get_ticket_audits(ticket_id: int, cursor: str | None = None, limit: int = 50) -> dict[str, Any]:
+async def get_ticket_audits(
+    ticket_id: int, cursor: str | None = None, limit: int = 50, field_name: str | None = None
+) -> dict[str, Any]:
     """Get a ticket's change history (who changed what field and when). Comment-only audits
-    are omitted; use get_ticket_comments for the conversation itself. Returns up to limit
-    audits (default 50); pass the previous call's next_cursor to fetch more."""
-    return await tickets.get_ticket_audits(zendesk, ticket_id, cursor=cursor, limit=limit)
+    are omitted; use get_ticket_comments for the conversation itself. Pass field_name (e.g.
+    "status", "assignee_id", "priority") to get only that field's changes instead of the whole
+    history. Returns up to limit audits (default 50) — count is after filtering, so it can be 0
+    with a non-null next_cursor; pass the previous call's next_cursor to fetch more."""
+    return await tickets.get_ticket_audits(
+        zendesk, ticket_id, cursor=cursor, limit=limit, field_name=field_name
+    )
 
 
 @mcp.tool()
@@ -149,7 +163,8 @@ async def search_tickets(
     requester_name/assignee_name/group_name/organization_name when that Zendesk object is known.
     sort_by accepts "updated_at", "created_at", "priority", "status", or "ticket_type"; sort_order
     is "asc" or "desc". Returns up to limit results (default 25, keep it low); pass the previous
-    call's next_cursor to fetch more."""
+    call's next_cursor to fetch more. total_matches is how many tickets match the query in
+    Zendesk — if it is much larger than limit, narrow the query instead of paging."""
     return await search.search_tickets(
         zendesk, query, sort_by=sort_by, sort_order=sort_order, cursor=cursor, limit=limit
     )
@@ -162,9 +177,14 @@ async def get_user(user_id: int | None = None, email: str | None = None) -> dict
 
 
 @mcp.tool()
-async def list_organizations() -> dict[str, Any]:
-    """List organizations registered in Zendesk."""
-    return await users.list_organizations(zendesk)
+async def list_organizations(
+    name: str | None = None, cursor: str | None = None, limit: int = 25
+) -> dict[str, Any]:
+    """List organizations registered in Zendesk. Pass name to look one up by (partial) name
+    instead of paging the whole account — prefer that whenever you already know who you're
+    after. Otherwise returns up to limit organizations (default 25); pass the previous call's
+    next_cursor to fetch more."""
+    return await users.list_organizations(zendesk, name=name, cursor=cursor, limit=limit)
 
 
 @mcp.tool()
@@ -184,8 +204,10 @@ async def search_guides(
     not support tickets; use search_tickets for a customer's actual conversation/request
     history. Returns a short snippet per article (never the full body) — call get_guide for an
     article whose snippet looks relevant. Results are deduplicated across translations and
-    near-duplicate section/title matches, then capped at limit (default 5, keep it low). Help
-    Center paging is offset-based: pass page=2 when has_more is true."""
+    near-duplicate section/title matches, then capped at limit (default 5, keep it low).
+    total_matches is how many articles match in Zendesk — if it is much larger than limit, use
+    more specific keywords instead of paging. Help Center paging is offset-based: pass page=2
+    when has_more is true."""
     return await guides.search_guides(zendesk, query, limit=limit, page=page, locale=locale)
 
 
