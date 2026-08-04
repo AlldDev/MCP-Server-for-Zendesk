@@ -35,7 +35,8 @@ class FakeZendeskClient:
 async def test_list_tickets_without_filters_uses_plain_listing():
     client = FakeZendeskClient({"/tickets.json": {"tickets": [{"id": 1}]}})
     result = await tickets.list_tickets(client)
-    assert result == {"count": 1, "tickets": [{"id": 1}], "next_cursor": None}
+    # Cursor listing has no total; only search reports one.
+    assert result == {"count": 1, "total_matches": None, "tickets": [{"id": 1}], "next_cursor": None}
     assert client.calls[0][:2] == ("GET", "/tickets.json")
 
 
@@ -49,13 +50,21 @@ async def test_list_tickets_strips_noise_fields():
 
 @pytest.mark.asyncio
 async def test_list_tickets_with_filters_uses_search():
-    client = FakeZendeskClient({"/search.json": {"results": [{"id": 2}]}})
+    client = FakeZendeskClient({"/search.json": {"results": [{"id": 2}], "count": 1}})
     result = await tickets.list_tickets(client, status="open", requester_email="a@b.com")
-    assert result == {"count": 1, "tickets": [{"id": 2}], "next_cursor": None}
+    assert result == {"count": 1, "total_matches": 1, "tickets": [{"id": 2}], "next_cursor": None}
     method, path, kwargs = client.calls[0]
     assert (method, path) == ("GET", "/search.json")
     assert "status:open" in kwargs["params"]["query"]
     assert "requester:a@b.com" in kwargs["params"]["query"]
+
+
+@pytest.mark.asyncio
+async def test_list_tickets_reports_zendesk_total_not_just_page_size():
+    client = FakeZendeskClient({"/search.json": {"results": [{"id": 1}, {"id": 2}], "count": 317}})
+    result = await tickets.list_tickets(client, status="open", limit=2)
+    assert result["count"] == 2
+    assert result["total_matches"] == 317
 
 
 @pytest.mark.asyncio
@@ -126,9 +135,33 @@ async def test_get_ticket_drops_unset_custom_fields():
         "id": 5,
         "custom_fields": [{"id": 1, "value": "x"}, {"id": 2, "value": None}],
     }
-    client = FakeZendeskClient({"/tickets/5.json": {"ticket": raw_ticket}})
+    client = FakeZendeskClient(
+        {
+            "/tickets/5.json": {"ticket": raw_ticket},
+            "/ticket_fields.json": {"ticket_fields": [{"id": 1, "title": "Contrato"}]},
+        }
+    )
     result = await tickets.get_ticket(client, 5)
-    assert result["custom_fields"] == [{"id": 1, "value": "x"}]
+    assert result["custom_fields"] == [{"id": 1, "name": "Contrato", "value": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_skips_field_lookup_when_no_custom_fields():
+    client = FakeZendeskClient({"/tickets/5.json": {"ticket": {"id": 5, "custom_fields": []}}})
+    await tickets.get_ticket(client, 5)
+    assert [path for _, path, _ in client.calls] == ["/tickets/5.json"]
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_custom_field_without_known_title():
+    client = FakeZendeskClient(
+        {
+            "/tickets/5.json": {"ticket": {"id": 5, "custom_fields": [{"id": 99, "value": "x"}]}},
+            "/ticket_fields.json": {"ticket_fields": [{"id": 1, "title": "Contrato"}]},
+        }
+    )
+    result = await tickets.get_ticket(client, 5)
+    assert result["custom_fields"] == [{"id": 99, "name": None, "value": "x"}]
 
 
 @pytest.mark.asyncio
@@ -233,6 +266,24 @@ async def test_get_ticket_comments_respects_limit():
 
 
 @pytest.mark.asyncio
+async def test_get_ticket_comments_defaults_to_a_small_page():
+    client = FakeZendeskClient({"/tickets/7/comments.json": {"comments": []}})
+    await tickets.get_ticket_comments(client, 7)
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["page[size]"] == 20
+    assert "sort_order" not in kwargs["params"]
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_comments_newest_first():
+    client = FakeZendeskClient({"/tickets/7/comments.json": {"comments": []}})
+    await tickets.get_ticket_comments(client, 7, limit=3, sort_order="desc")
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["sort_order"] == "desc"
+    assert kwargs["params"]["page[size]"] == 3
+
+
+@pytest.mark.asyncio
 async def test_get_ticket_comments_truncates_long_body():
     long_body = "word " * tickets.COMMENT_BODY_MAX_CHARS
     client = FakeZendeskClient(
@@ -283,6 +334,36 @@ async def test_get_ticket_audits_keeps_only_change_events():
 
 
 @pytest.mark.asyncio
+async def test_get_ticket_audits_filters_by_field_name():
+    client = FakeZendeskClient(
+        {
+            "/tickets/7/audits.json": {
+                "audits": [
+                    {
+                        "id": 1,
+                        "created_at": "t1",
+                        "events": [
+                            {"type": "Change", "field_name": "status", "previous_value": "new", "value": "open"},
+                            {"type": "Change", "field_name": "priority", "previous_value": None, "value": "high"},
+                        ],
+                    },
+                    {
+                        "id": 2,
+                        "created_at": "t2",
+                        "events": [{"type": "Change", "field_name": "priority", "value": "urgent"}],
+                    },
+                ],
+            }
+        }
+    )
+    result = await tickets.get_ticket_audits(client, 7, field_name="status")
+    assert result["count"] == 1
+    assert result["audits"][0]["changes"] == [
+        {"field_name": "status", "previous_value": "new", "value": "open"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_ticket_audits_respects_limit():
     client = FakeZendeskClient({"/tickets/7/audits.json": {"audits": []}})
     await tickets.get_ticket_audits(client, 7, limit=10)
@@ -317,9 +398,9 @@ async def test_get_ticket_audits_truncates_long_values():
 
 @pytest.mark.asyncio
 async def test_search_tickets_scopes_to_type_ticket():
-    client = FakeZendeskClient({"/search.json": {"results": [{"id": 1}]}})
+    client = FakeZendeskClient({"/search.json": {"results": [{"id": 1}], "count": 1}})
     result = await search.search_tickets(client, "billing issue")
-    assert result == {"count": 1, "tickets": [{"id": 1}], "next_cursor": None}
+    assert result == {"count": 1, "total_matches": 1, "tickets": [{"id": 1}], "next_cursor": None}
     _, _, kwargs = client.calls[0]
     assert kwargs["params"]["query"] == "type:ticket billing issue"
     assert kwargs["params"]["include"] == "users,groups,organizations"
@@ -422,16 +503,48 @@ async def test_get_user_requires_exactly_one_selector():
 
 @pytest.mark.asyncio
 async def test_list_organizations():
-    client = FakeZendeskClient({"/organizations.json": {"organizations": [{"id": 1}, {"id": 2}]}})
+    client = FakeZendeskClient(
+        {"/organizations.json": {"organizations": [{"id": 1}, {"id": 2}], "next_page": "https://x?page=2"}}
+    )
     result = await users.list_organizations(client)
-    assert result == {"count": 2, "organizations": [{"id": 1}, {"id": 2}]}
+    assert result == {"count": 2, "organizations": [{"id": 1}, {"id": 2}], "next_cursor": "2"}
+    _, _, kwargs = client.calls[0]
+    assert kwargs["params"]["per_page"] == 25
+
+
+@pytest.mark.asyncio
+async def test_list_organizations_by_name_uses_autocomplete():
+    client = FakeZendeskClient(
+        {"/organizations/autocomplete.json": {"organizations": [{"id": 1, "name": "Acme"}]}}
+    )
+    result = await users.list_organizations(client, name="Acme")
+    assert result == {
+        "count": 1,
+        "organizations": [{"id": 1, "name": "Acme"}],
+        "next_cursor": None,
+    }
+    assert client.calls == [("GET", "/organizations/autocomplete.json", {"params": {"name": "Acme"}})]
 
 
 @pytest.mark.asyncio
 async def test_list_groups():
     client = FakeZendeskClient({"/groups.json": {"groups": [{"id": 1, "name": "N1"}]}})
     result = await groups.list_groups(client)
-    assert result == {"count": 1, "groups": [{"id": 1, "name": "N1"}]}
+    assert result == {"count": 1, "groups": [{"id": 1, "name": "N1"}], "has_more": False}
+
+
+@pytest.mark.asyncio
+async def test_list_groups_paginates_past_the_first_page():
+    client = FakeZendeskClient(
+        {
+            "/groups.json": [
+                {"groups": [{"id": 1, "name": "N1"}], "next_page": "https://x/groups.json?page=2"},
+                {"groups": [{"id": 2, "name": "N2"}], "next_page": None},
+            ]
+        }
+    )
+    # A group past the first page used to be invisible, so list_tickets(group="N2") failed.
+    assert await groups.resolve_group_id(client, "N2") == 2
 
 
 @pytest.mark.asyncio
@@ -456,7 +569,7 @@ async def test_list_tickets_with_group_name_resolves_to_id():
         }
     )
     result = await tickets.list_tickets(client, group="N1")
-    assert result == {"count": 1, "tickets": [{"id": 3}], "next_cursor": None}
+    assert result == {"count": 1, "total_matches": None, "tickets": [{"id": 3}], "next_cursor": None}
     _, _, kwargs = client.calls[-1]
     assert "group:7" in kwargs["params"]["query"]
 
@@ -482,6 +595,8 @@ async def test_list_tickets_with_numeric_group_skips_resolution():
 
 _SECTIONS = {"sections": [{"id": 10, "name": "Boletos", "category_id": 200}]}
 _CATEGORIES = {"categories": [{"id": 200, "name": "Faturamento"}]}
+# search_guides/get_guide name sections by ID instead of walking the whole taxonomy.
+_SECTION_10 = {"section": {"id": 10, "name": "Boletos", "category_id": 200}}
 
 
 @pytest.mark.asyncio
@@ -501,9 +616,8 @@ async def test_search_guides_returns_snippet_not_body():
     }
     client = FakeZendeskClient(
         {
-            "/help_center/articles/search.json": {"results": [article]},
-            "/help_center/sections.json": _SECTIONS,
-            "/help_center/categories.json": _CATEGORIES,
+            "/help_center/articles/search.json": {"results": [article], "count": 1},
+            "/help_center/sections/10.json": _SECTION_10,
         }
     )
     result = await guides.search_guides(client, "boleto")
@@ -516,6 +630,12 @@ async def test_search_guides_returns_snippet_not_body():
             "url": "https://x.zendesk.com/hc/pt-br/articles/1",
         }
     ]
+    assert result["total_matches"] == 1
+    # The whole-Help-Center taxonomy walk is what used to cost up to 40 requests per search.
+    assert [path for _, path, _ in client.calls] == [
+        "/help_center/articles/search.json",
+        "/help_center/sections/10.json",
+    ]
 
 
 @pytest.mark.asyncio
@@ -527,8 +647,7 @@ async def test_search_guides_dedupes_translations():
     client = FakeZendeskClient(
         {
             "/help_center/articles/search.json": {"results": [en, pt]},
-            "/help_center/sections.json": {"sections": []},
-            "/help_center/categories.json": {"categories": []},
+            "/help_center/sections/10.json": _SECTION_10,
         }
     )
     result = await guides.search_guides(client, "pay")
@@ -544,8 +663,8 @@ async def test_search_guides_ranks_exact_title_first():
     client = FakeZendeskClient(
         {
             "/help_center/articles/search.json": {"results": [first, second]},
-            "/help_center/sections.json": {"sections": []},
-            "/help_center/categories.json": {"categories": []},
+            "/help_center/sections/10.json": _SECTION_10,
+            "/help_center/sections/11.json": {"section": {"id": 11, "name": "Cartões", "category_id": 200}},
         }
     )
     result = await guides.search_guides(client, "boleto")
@@ -572,12 +691,16 @@ async def test_get_guide_cleans_html():
     }
     client = FakeZendeskClient(
         {
-            "/help_center/articles/5.json": {"article": article},
-            "/help_center/sections.json": _SECTIONS,
-            "/help_center/categories.json": _CATEGORIES,
+            "/help_center/articles/5.json": {
+                "article": article,
+                # include=sections,categories sideloads both, so no extra request is needed.
+                **_SECTIONS,
+                **_CATEGORIES,
+            },
         }
     )
     result = await guides.get_guide(client, 5)
+    assert [path for _, path, _ in client.calls] == ["/help_center/articles/5.json"]
     assert set(result.keys()) == {"id", "title", "body", "url", "category", "section", "updated_at", "locale"}
     assert "alert(1)" not in result["body"]
     assert "color:red" not in result["body"]
@@ -601,16 +724,48 @@ async def test_get_guide_truncates_long_body():
         "updated_at": "2024-01-01T00:00:00Z",
         "body": long_body,
     }
-    client = FakeZendeskClient(
-        {
-            "/help_center/articles/6.json": {"article": article},
-            "/help_center/sections.json": {"sections": []},
-            "/help_center/categories.json": {"categories": []},
-        }
-    )
+    client = FakeZendeskClient({"/help_center/articles/6.json": {"article": article}})
     result = await guides.get_guide(client, 6)
     assert result["truncated"] is True
     assert len(result["body"]) <= guides.MAX_BODY_CHARS + 1
+
+
+@pytest.mark.asyncio
+async def test_get_guide_falls_back_when_sideload_is_absent():
+    article = {
+        "id": 7,
+        "title": "Sem sideload",
+        "section_id": 10,
+        "html_url": "u7",
+        "locale": "pt-br",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "body": "<p>corpo</p>",
+    }
+    client = FakeZendeskClient(
+        {
+            "/help_center/articles/7.json": {"article": article},
+            "/help_center/sections/10.json": _SECTION_10,
+            "/help_center/categories/200.json": {"category": {"id": 200, "name": "Faturamento"}},
+        }
+    )
+    result = await guides.get_guide(client, 7)
+    assert result["section"] == "Boletos"
+    assert result["category"] == "Faturamento"
+
+
+@pytest.mark.asyncio
+async def test_get_guide_survives_restricted_section():
+    class _RestrictedSectionClient(FakeZendeskClient):
+        async def get(self, path, **kwargs):
+            if path.startswith("/help_center/sections/"):
+                raise ZendeskAPIError("denied", status=403)
+            return await super().get(path, **kwargs)
+
+    article = {"id": 8, "title": "T", "section_id": 10, "html_url": "u8", "body": "<p>x</p>"}
+    client = _RestrictedSectionClient({"/help_center/articles/8.json": {"article": article}})
+    result = await guides.get_guide(client, 8)
+    assert result["section"] is None
+    assert result["category"] is None
 
 
 @pytest.mark.asyncio
@@ -687,7 +842,7 @@ async def test_paginate_all_stops_at_max_pages():
             ],
         }
     )
-    items, truncated = await guides._paginate_all(client, "/x.json", "items", max_pages=2)
+    items, truncated = await fields.paginate_all(client, "/x.json", "items", max_pages=2)
     assert len(items) == 2
     assert truncated is True
 
@@ -921,6 +1076,7 @@ async def test_list_guide_permissions_trims_fields():
     assert result == {
         "permission_groups": [{"id": 42, "name": "Agents and Managers"}],
         "user_segments": [{"id": 7, "name": "Signed-in users"}],
+        "has_more": False,
     }
 
 

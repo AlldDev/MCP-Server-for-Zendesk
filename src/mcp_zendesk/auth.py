@@ -17,7 +17,7 @@ class BearerAuthMiddleware:
     """ASGI middleware requiring a per-client bearer token (API key) on every HTTP request.
 
     Independent of Zendesk credentials: this protects the MCP server itself,
-    since it is exposed on the public internet (spec section 6.1). Each client
+    since it is exposed on the public internet. Each client
     has its own token, so one can be revoked without affecting the others.
 
     Failed attempts are rate-limited per source IP with exponential backoff: after
