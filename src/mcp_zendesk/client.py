@@ -10,6 +10,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
+# 502/503/504 are gateway/service-unavailable errors, typically transient like a 429. A bare
+# 500 is deliberately excluded — it can be a deterministic server-side bug that retrying won't fix.
+_RETRYABLE_STATUSES = {429, 502, 503, 504}
 
 
 class ZendeskAPIError(Exception):
@@ -161,13 +164,31 @@ class ZendeskClient:
         return data
 
     async def _send_with_retry(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Retry on 429/502/503/504 (Retry-After if given, else exponential backoff) and on
+        network/transport errors (no Retry-After available, so always exponential backoff).
+        A network error on the final attempt is wrapped in ZendeskAPIError rather than left to
+        propagate raw — _parse is meant to be the only place a caller sees a typed error."""
         response: httpx.Response
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            response = await self._client.request(method, path, **kwargs)
-            if response.status_code != 429 or attempt == MAX_ATTEMPTS:
+            try:
+                response = await self._client.request(method, path, **kwargs)
+            except httpx.TransportError as exc:
+                if attempt == MAX_ATTEMPTS:
+                    raise ZendeskAPIError(f"Could not reach Zendesk: {exc}") from exc
+                delay = 2**attempt
+                logger.warning(
+                    "Zendesk request failed (%s, attempt %d/%d), retrying in %.1fs",
+                    type(exc).__name__, attempt, MAX_ATTEMPTS, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code not in _RETRYABLE_STATUSES or attempt == MAX_ATTEMPTS:
                 return response
             delay = float(response.headers.get("Retry-After", 2**attempt))
-            logger.warning("Zendesk rate limit hit (attempt %d/%d), retrying in %.1fs", attempt, MAX_ATTEMPTS, delay)
+            logger.warning(
+                "Zendesk request failed with %d (attempt %d/%d), retrying in %.1fs",
+                response.status_code, attempt, MAX_ATTEMPTS, delay,
+            )
             await asyncio.sleep(delay)
         return response
 

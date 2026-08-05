@@ -73,7 +73,8 @@ async def list_tickets(
 async def get_ticket(ticket_id: int) -> dict[str, Any]:
     """Get full details for a single Zendesk Support ticket (a customer conversation/request)
     by ID — not a Help Center article; use get_guide for that. Custom fields come back with the
-    field's name alongside its id and value."""
+    field's name alongside its id and value. When present, satisfaction_rating has score
+    ("good"/"bad"/"offered"/"unoffered") and the customer's comment, if any."""
     return await tickets.get_ticket(zendesk, ticket_id)
 
 
@@ -129,7 +130,8 @@ async def get_ticket_comments(
 ) -> dict[str, Any]:
     """Get a ticket's comment thread, oldest first by default. Returns up to limit comments
     (default 20); pass the previous call's next_cursor to fetch more. To read only how a long
-    thread ends, pass sort_order="desc" with a small limit instead of paging the whole thread."""
+    thread ends, pass sort_order="desc" with a small limit instead of paging the whole thread.
+    Comments with a file attached include an attachments list (filename, url, type, size)."""
     return await tickets.get_ticket_comments(
         zendesk, ticket_id, cursor=cursor, limit=limit, sort_order=sort_order
     )
@@ -304,4 +306,6 @@ app = BearerAuthMiddleware(
     exempt_paths=exempt_paths,
     max_attempts=settings.auth_rate_limit_max_attempts,
     base_seconds=settings.auth_rate_limit_base_seconds,
+    client_rate_limit_max_requests=settings.client_rate_limit_max_requests,
+    client_rate_limit_window_seconds=settings.client_rate_limit_window_seconds,
 )

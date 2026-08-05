@@ -113,6 +113,78 @@ async def test_429_exhausted_raises():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_503_retries_then_succeeds():
+    mock_oauth_token()
+    route = respx.get(f"{BASE_URL}/tickets.json")
+    route.side_effect = [
+        httpx.Response(503, headers={"Retry-After": "0"}),
+        httpx.Response(200, json={"tickets": []}),
+    ]
+    client = make_client()
+    data = await client.get("/tickets.json")
+    assert data == {"tickets": []}
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_503_exhausted_raises():
+    mock_oauth_token()
+    respx.get(f"{BASE_URL}/tickets.json").mock(return_value=httpx.Response(503, headers={"Retry-After": "0"}))
+    client = make_client()
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await client.get("/tickets.json")
+    assert exc_info.value.status == 503
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_bare_500_is_not_retried():
+    mock_oauth_token()
+    route = respx.get(f"{BASE_URL}/tickets.json").mock(return_value=httpx.Response(500))
+    client = make_client()
+    with pytest.raises(ZendeskAPIError) as exc_info:
+        await client.get("/tickets.json")
+    assert exc_info.value.status == 500
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_network_error_retries_then_succeeds(monkeypatch):
+    import mcp_zendesk.client as client_module
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(client_module.asyncio, "sleep", no_sleep)
+    mock_oauth_token()
+    route = respx.get(f"{BASE_URL}/tickets.json")
+    route.side_effect = [httpx.ConnectError("boom"), httpx.Response(200, json={"tickets": []})]
+    client = make_client()
+    data = await client.get("/tickets.json")
+    assert data == {"tickets": []}
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_network_error_exhausted_raises_zendesk_api_error(monkeypatch):
+    import mcp_zendesk.client as client_module
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(client_module.asyncio, "sleep", no_sleep)
+    mock_oauth_token()
+    respx.get(f"{BASE_URL}/tickets.json").mock(side_effect=httpx.ConnectError("boom"))
+    client = make_client()
+    with pytest.raises(ZendeskAPIError, match="Could not reach Zendesk"):
+        await client.get("/tickets.json")
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_repeated_get_within_ttl_hits_cache_not_network():
     mock_oauth_token()
     route = respx.get(f"{BASE_URL}/tickets/1.json").mock(return_value=httpx.Response(200, json={"ticket": {"id": 1}}))

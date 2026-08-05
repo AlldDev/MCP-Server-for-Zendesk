@@ -117,3 +117,60 @@ def test_rate_limit_unblocks_after_backoff_elapses():
     clock.now += 10
     response = client.get("/", headers={"Authorization": "Bearer wrong-token", "X-Forwarded-For": "1.2.3.4"})
     assert response.status_code == 401
+
+
+def test_client_rate_limit_disabled_by_default():
+    response = make_test_client().get("/", headers={"Authorization": "Bearer alice-token"})
+    assert response.status_code == 200
+
+
+def test_client_rate_limit_blocks_after_max_requests():
+    clock = FakeClock()
+    inner = Starlette(routes=[Route("/", _ok)])
+    app = BearerAuthMiddleware(
+        inner,
+        api_keys={"alice-token": "alice"},
+        client_rate_limit_max_requests=2,
+        client_rate_limit_window_seconds=60.0,
+        clock=clock,
+    )
+    client = TestClient(app)
+    for _ in range(2):
+        response = client.get("/", headers={"Authorization": "Bearer alice-token"})
+        assert response.status_code == 200
+    response = client.get("/", headers={"Authorization": "Bearer alice-token"})
+    assert response.status_code == 429
+    assert "Retry-After" in response.headers
+
+
+def test_client_rate_limit_is_tracked_per_client_not_globally():
+    clock = FakeClock()
+    inner = Starlette(routes=[Route("/", _ok)])
+    app = BearerAuthMiddleware(
+        inner,
+        api_keys={"alice-token": "alice", "bob-token": "bob"},
+        client_rate_limit_max_requests=1,
+        client_rate_limit_window_seconds=60.0,
+        clock=clock,
+    )
+    client = TestClient(app)
+    assert client.get("/", headers={"Authorization": "Bearer alice-token"}).status_code == 200
+    assert client.get("/", headers={"Authorization": "Bearer alice-token"}).status_code == 429
+    assert client.get("/", headers={"Authorization": "Bearer bob-token"}).status_code == 200
+
+
+def test_client_rate_limit_resets_after_window_elapses():
+    clock = FakeClock()
+    inner = Starlette(routes=[Route("/", _ok)])
+    app = BearerAuthMiddleware(
+        inner,
+        api_keys={"alice-token": "alice"},
+        client_rate_limit_max_requests=1,
+        client_rate_limit_window_seconds=60.0,
+        clock=clock,
+    )
+    client = TestClient(app)
+    assert client.get("/", headers={"Authorization": "Bearer alice-token"}).status_code == 200
+    assert client.get("/", headers={"Authorization": "Bearer alice-token"}).status_code == 429
+    clock.now += 61
+    assert client.get("/", headers={"Authorization": "Bearer alice-token"}).status_code == 200
