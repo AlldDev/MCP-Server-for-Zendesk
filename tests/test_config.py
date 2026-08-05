@@ -49,3 +49,24 @@ def test_oauth_scope_honors_override(monkeypatch):
     monkeypatch.setenv("ZENDESK_OAUTH_SCOPE", "read")
     settings = load_settings()
     assert settings.zendesk_oauth_scope == "read"
+
+
+def test_client_rate_limit_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("CLIENT_RATE_LIMIT_MAX_REQUESTS", raising=False)
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MCP_SERVER_API_KEYS", '{"alice": "tok-a"}')
+    settings = load_settings()
+    assert settings.client_rate_limit_max_requests is None
+    assert settings.client_rate_limit_window_seconds == 60.0
+
+
+def test_client_rate_limit_honors_override(monkeypatch):
+    for key, value in BASE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MCP_SERVER_API_KEYS", '{"alice": "tok-a"}')
+    monkeypatch.setenv("CLIENT_RATE_LIMIT_MAX_REQUESTS", "100")
+    monkeypatch.setenv("CLIENT_RATE_LIMIT_WINDOW_SECONDS", "30")
+    settings = load_settings()
+    assert settings.client_rate_limit_max_requests == 100
+    assert settings.client_rate_limit_window_seconds == 30.0

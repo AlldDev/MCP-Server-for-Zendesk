@@ -5,7 +5,9 @@ from typing import Any
 from mcp_zendesk.client import ZendeskClient
 from mcp_zendesk.models import TicketPriority, TicketStatus
 from mcp_zendesk.tools.fields import (
+    ATTACHMENT_FIELDS,
     COMMENT_FIELDS,
+    SATISFACTION_FIELDS,
     TICKET_DETAIL_FIELDS,
     build_name_maps,
     enrich_ticket,
@@ -13,6 +15,7 @@ from mcp_zendesk.tools.fields import (
     offset_page_params,
     paginate_all,
     project,
+    project_list,
     truncate,
 )
 from mcp_zendesk.tools.groups import resolve_group_id
@@ -33,6 +36,11 @@ def _project_ticket_detail(ticket: dict[str, Any]) -> dict[str, Any]:
         out["description"] = body
         if truncated:
             out["description_truncated"] = True
+    if isinstance(rating := out.get("satisfaction_rating"), dict):
+        rating = project(rating, SATISFACTION_FIELDS)
+        if comment := rating.get("comment"):
+            rating["comment"], _truncated = truncate(comment, COMMENT_BODY_MAX_CHARS)
+        out["satisfaction_rating"] = rating
     return out
 
 
@@ -121,7 +129,9 @@ async def list_tickets(
 
 async def get_ticket(client: ZendeskClient, ticket_id: int) -> dict[str, Any]:
     """Get full details for a single Zendesk Support ticket (a customer conversation/request)
-    by ID — not a Help Center article; use get_guide for that."""
+    by ID — not a Help Center article; use get_guide for that. Custom fields come back with
+    the field's name alongside its id and value. When present, satisfaction_rating has score
+    ("good"/"bad"/"offered"/"unoffered") and the customer's comment, if any."""
     data = await client.get(f"/tickets/{ticket_id}.json")
     return await _ticket_detail(client, data["ticket"])
 
@@ -201,6 +211,8 @@ def _project_comment(comment: dict[str, Any]) -> dict[str, Any]:
         out["body"] = text
         if truncated:
             out["truncated"] = True
+    if attachments := out.get("attachments"):
+        out["attachments"] = project_list(attachments, ATTACHMENT_FIELDS)
     return out
 
 
@@ -213,7 +225,8 @@ async def get_ticket_comments(
 ) -> dict[str, Any]:
     """Get a ticket's comment thread, oldest first by default. Returns up to limit comments
     (default 20); pass the previous call's next_cursor to fetch more. To read only how a long
-    thread ends, pass sort_order="desc" with a small limit instead of paging the whole thread."""
+    thread ends, pass sort_order="desc" with a small limit instead of paging the whole thread.
+    Comments with a file attached include an attachments list (filename, url, type, size)."""
     params: dict[str, Any] = {"page[size]": max(1, min(limit, 100))}
     if cursor:
         params["page[after]"] = cursor

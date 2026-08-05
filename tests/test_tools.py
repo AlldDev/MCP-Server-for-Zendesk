@@ -165,6 +165,40 @@ async def test_get_ticket_custom_field_without_known_title():
 
 
 @pytest.mark.asyncio
+async def test_get_ticket_projects_satisfaction_rating_fields():
+    raw_ticket = {
+        "id": 5,
+        "satisfaction_rating": {
+            "id": 918273,
+            "score": "good",
+            "comment": "Great support!",
+            "assignee_id": 42,
+            "url": "https://x.zendesk.com/satisfaction_ratings/918273.json",
+        },
+    }
+    client = FakeZendeskClient({"/tickets/5.json": {"ticket": raw_ticket}})
+    result = await tickets.get_ticket(client, 5)
+    assert result["satisfaction_rating"] == {"score": "good", "comment": "Great support!"}
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_satisfaction_rating_without_comment():
+    client = FakeZendeskClient({"/tickets/5.json": {"ticket": {"id": 5, "satisfaction_rating": {"score": "unoffered"}}}})
+    result = await tickets.get_ticket(client, 5)
+    assert result["satisfaction_rating"] == {"score": "unoffered"}
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_truncates_long_satisfaction_comment():
+    long_comment = "word " * tickets.COMMENT_BODY_MAX_CHARS
+    client = FakeZendeskClient(
+        {"/tickets/5.json": {"ticket": {"id": 5, "satisfaction_rating": {"score": "bad", "comment": long_comment}}}}
+    )
+    result = await tickets.get_ticket(client, 5)
+    assert len(result["satisfaction_rating"]["comment"]) <= tickets.COMMENT_BODY_MAX_CHARS + 1
+
+
+@pytest.mark.asyncio
 async def test_list_tickets_respects_limit():
     client = FakeZendeskClient({"/tickets.json": {"tickets": []}})
     await tickets.list_tickets(client, limit=10)
@@ -297,6 +331,58 @@ async def test_get_ticket_comments_truncates_long_body():
     comment = result["comments"][0]
     assert len(comment["body"]) <= tickets.COMMENT_BODY_MAX_CHARS + 1
     assert comment["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_comments_includes_attachment_metadata():
+    client = FakeZendeskClient(
+        {
+            "/tickets/7/comments.json": {
+                "comments": [
+                    {
+                        "id": 1,
+                        "author_id": 2,
+                        "body": "see attached",
+                        "public": True,
+                        "created_at": "t",
+                        "attachments": [
+                            {
+                                "id": 99,
+                                "file_name": "screenshot.png",
+                                "content_url": "https://x.zendesk.com/attachments/99/screenshot.png",
+                                "content_type": "image/png",
+                                "size": 12345,
+                                "thumbnails": [{"id": 100, "content_url": "https://x/thumb.png"}],
+                            }
+                        ],
+                    },
+                ],
+            }
+        }
+    )
+    result = await tickets.get_ticket_comments(client, 7)
+    assert result["comments"][0]["attachments"] == [
+        {
+            "id": 99,
+            "file_name": "screenshot.png",
+            "content_url": "https://x.zendesk.com/attachments/99/screenshot.png",
+            "content_type": "image/png",
+            "size": 12345,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_ticket_comments_without_attachments_key_when_absent():
+    client = FakeZendeskClient(
+        {
+            "/tickets/7/comments.json": {
+                "comments": [{"id": 1, "author_id": 2, "body": "hi", "public": True, "created_at": "t"}],
+            }
+        }
+    )
+    result = await tickets.get_ticket_comments(client, 7)
+    assert "attachments" not in result["comments"][0]
 
 
 @pytest.mark.asyncio

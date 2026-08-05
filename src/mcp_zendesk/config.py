@@ -43,6 +43,8 @@ class Settings:
     zendesk_webhook_secret: str | None  # webhook support disabled if unset
     auth_rate_limit_max_attempts: int
     auth_rate_limit_base_seconds: float
+    client_rate_limit_max_requests: int | None  # None disables per-client throttling
+    client_rate_limit_window_seconds: float
 
 
 def _load_api_keys() -> dict[str, str]:
@@ -70,4 +72,8 @@ def load_settings() -> Settings:
         zendesk_webhook_secret=os.environ.get("ZENDESK_WEBHOOK_SECRET") or None,
         auth_rate_limit_max_attempts=int(os.environ.get("AUTH_RATE_LIMIT_MAX_ATTEMPTS", "5")),
         auth_rate_limit_base_seconds=float(os.environ.get("AUTH_RATE_LIMIT_BASE_SECONDS", "1")),
+        client_rate_limit_max_requests=(
+            int(v) if (v := os.environ.get("CLIENT_RATE_LIMIT_MAX_REQUESTS")) else None
+        ),
+        client_rate_limit_window_seconds=float(os.environ.get("CLIENT_RATE_LIMIT_WINDOW_SECONDS", "60")),
     )

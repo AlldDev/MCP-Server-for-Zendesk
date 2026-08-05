@@ -6,11 +6,11 @@ Servidor MCP (Model Context Protocol) em Python que expõe operações do Zendes
 
 **Chamados (tickets)**
 - `list_tickets` — lista chamados, com filtro opcional por status, prioridade, e-mail do solicitante ou grupo; ordenação (`sort_by`/`sort_order`), paginação por cursor e `limit` de resultados por chamada (padrão 25).
-- `get_ticket` — detalhes completos de um chamado por ID; descrição longa é truncada (avisa via `description_truncated`). Campos personalizados vêm com o nome do campo, não só o ID numérico.
+- `get_ticket` — detalhes completos de um chamado por ID; descrição longa é truncada (avisa via `description_truncated`). Campos personalizados vêm com o nome do campo, não só o ID numérico. Quando existe, `satisfaction_rating` traz a nota do cliente (`good`/`bad`/`offered`/`unoffered`) e o comentário, se houver.
 - `create_ticket` — abre um novo chamado.
 - `update_ticket` — altera status, prioridade, atendente ou tags.
 - `add_comment` — adiciona um comentário público ou nota interna (visibilidade sempre explícita).
-- `get_ticket_comments` — histórico de comentários do chamado, paginado e limitado (`limit`, padrão 20); do mais antigo para o mais recente, ou só o fim da conversa com `sort_order="desc"`; corpo de comentário longo é truncado.
+- `get_ticket_comments` — histórico de comentários do chamado, paginado e limitado (`limit`, padrão 20); do mais antigo para o mais recente, ou só o fim da conversa com `sort_order="desc"`; corpo de comentário longo é truncado. Comentário com arquivo anexado traz `attachments` (nome, url, tipo, tamanho).
 - `get_ticket_audits` — histórico de mudanças do chamado (quem alterou o quê e quando), paginado e limitado (`limit`, padrão 50); aceita `field_name` para ver só as mudanças de um campo (ex.: `status`); valores longos são truncados.
 
 **Busca**
@@ -25,7 +25,7 @@ Servidor MCP (Model Context Protocol) em Python que expõe operações do Zendes
 - `search_guides` — busca artigos por palavra-chave; devolve só snippet (≈280 caracteres), nunca o corpo, com limite baixo por padrão (5).
 - `get_guide` — conteúdo completo de um artigo, com HTML convertido para texto legível e truncado em 8.000 caracteres (avisa via `truncated`). Artigo restrito (403) retorna mensagem clara em vez do erro genérico de credencial.
 - `list_guide_categories` — categorias com as seções já aninhadas dentro, para navegação exploratória.
-- `create_guide` — cria um artigo; `draft` (rascunho ou já publicado) e `visibility` são sempre explícitos, nunca têm valor padrão. `section` e `permission_group` aceitam nome ou ID numérico.
+- `create_guide` — cria um artigo; `draft` (rascunho ou já publicado) e `visibility` são sempre explícitos, nunca têm valor padrão. `section`, `permission_group` e `visibility` aceitam nome ou ID numérico (`visibility` também aceita `"everyone"`).
 - `update_guide` — altera título, corpo ou status de publicação de um artigo existente (via tradução do `locale`, já que o Zendesk não edita título/corpo pelo endpoint de artigo).
 - `list_guide_permissions` — lista permission groups e user segments disponíveis, para preencher `permission_group` e `visibility` de `create_guide`.
 
@@ -128,6 +128,8 @@ MCP_SERVER_API_KEYS={"claude-desktop": "8f3a1c2e9b7d4f6a0c1e5b8d2a7f4c9e", "ana-
 > Guarde esses tokens em um cofre de senhas ou gerenciador de segredos da equipe. Não podem ser recuperados depois se forem perdidos, apenas substituídos por novos (veja [seção 8](#8-rotação-de-tokens)).
 
 Tentativas de autenticação incorretas são limitadas por IP de origem, com backoff exponencial: depois de `AUTH_RATE_LIMIT_MAX_ATTEMPTS` falhas seguidas (padrão: 5), cada nova tentativa dobra o tempo de bloqueio (`AUTH_RATE_LIMIT_BASE_SECONDS`, padrão: 1s, teto de 5 min) até que um token correto seja apresentado.
+
+Opcionalmente (desativado por padrão), `CLIENT_RATE_LIMIT_MAX_REQUESTS` limita quantas chamadas *autenticadas* um mesmo `client_id` pode fazer a cada `CLIENT_RATE_LIMIT_WINDOW_SECONDS` (padrão: 60s) — um limite diferente do de cima, que só conta tentativas de token incorreto. Como todos os clientes compartilham as mesmas credenciais OAuth do Zendesk, um único cliente com bug (preso num loop de retry, por exemplo) pode esgotar o rate limit do Zendesk para todo mundo; esse limite existe para conter isso na origem, por cliente, antes que chegue no Zendesk.
 
 ---
 
@@ -272,11 +274,13 @@ Duas otimizações desabilitadas por padrão se as variáveis correspondentes n�
 
 ### Cache de leitura
 
-`CACHE_TTL_SECONDS` (padrão: 30) mantém em memória, por até esse número de segundos, o resultado das
-tools de leitura (`list_tickets`, `get_ticket`, `search_tickets`, `get_user`, `list_organizations`,
-`list_groups`, `search_guides`, `get_guide`, `list_guide_categories`), além das consultas de apoio que
-elas repetem (nome de grupo, nomes dos campos personalizados, seções do Help Center) — é o cache que faz
-essas buscas auxiliares custarem, na prática, uma requisição por janela e não uma por chamada. Qualquer escrita feita pelo
+`CACHE_TTL_SECONDS` (padrão: 30) mantém em memória, por até esse número de segundos, o resultado de
+toda requisição GET — ou seja, todas as tools de leitura (`list_tickets`, `get_ticket`,
+`get_ticket_comments`, `get_ticket_audits`, `search_tickets`, `get_user`, `list_organizations`,
+`list_groups`, `search_guides`, `get_guide`, `list_guide_categories`, `list_guide_permissions`), além
+das consultas de apoio que elas repetem (nome de grupo, nomes dos campos personalizados, seções do
+Help Center) — é o cache que faz essas buscas auxiliares custarem, na prática, uma requisição por
+janela e não uma por chamada. Qualquer escrita feita pelo
 próprio servidor (`create_ticket`, `update_ticket`, `add_comment`, `create_guide`, `update_guide`)
 limpa na hora só o cache do tipo de recurso afetado — escrever um chamado não derruba o cache de
 artigos do Help Center (nem de grupos, organizações etc.), e vice-versa. O evento de webhook (abaixo),
@@ -333,6 +337,8 @@ falham na verificação de assinatura e são rejeitados com 401.
 | Conexão recusada/timeout | IP do cliente não está na allowlist do firewall | Adicione o IP no security group da Cloud |
 | Erros vindos do Zendesk (401/403) | `ZENDESK_OAUTH_CLIENT_ID`/`ZENDESK_OAUTH_CLIENT_SECRET` inválidos, ou grant `client_credentials` não habilitado nesse OAuth client | Confirme as credenciais no Admin Center (Apps and integrations > APIs > OAuth clients); gere um novo secret se necessário |
 | `404 Not Found` em recursos que deveriam existir | Recurso não encontrado (não é problema de credencial) | Confirme o ID do recurso |
-| `429 Too Many Requests` | Limite de rate limiting do Zendesk atingido | Aguarde o retry automático (backoff exponencial) ou reduza o volume de chamadas |
+| `429 Too Many Requests` do Zendesk | Limite de rate limiting do Zendesk atingido | O servidor já tenta de novo sozinho (backoff exponencial); se persistir, reduza o volume de chamadas |
+| `429 Too Many Requests` vindo do próprio MCP (não do Zendesk) | `CLIENT_RATE_LIMIT_MAX_REQUESTS` atingido por esse `client_id` | Espere o `Retry-After` indicado, ou aumente o limite no `.env` se for esperado desse cliente |
+| Erros 502/503/504 do Zendesk | Zendesk temporariamente indisponível | O servidor já tenta de novo sozinho (backoff exponencial); se persistir, é uma instabilidade do lado do Zendesk |
 | Container do `app` reinicia em loop | `.env` incompleto/inválido (`load_settings` falha na subida) | Confira `docker compose logs app` pela mensagem de variável faltando e corrija o `.env` |
 | `401` em `POST /webhooks/zendesk` | `ZENDESK_WEBHOOK_SECRET` não bate com o signing secret configurado no Zendesk | Confirme o valor no Admin Center (Apps and integrations > Webhooks) e no `.env`; reinicie o servidor |

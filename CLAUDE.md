@@ -43,19 +43,29 @@ Request flow: `BearerAuthMiddleware` (auth.py) wraps the whole ASGI app → MCP'
   once: OAuth `client_credentials` token lifecycle (auto-fetch, early refresh ~30s before expiry, forced
   refresh + single retry on a live 401 — the token lives in `self._token` and is attached per-request,
   never on `self._client.headers`, so the `/oauth/tokens` POST goes out with no `Authorization` header;
-  Zendesk 401s the token endpoint if it carries the expired bearer token), 429 retry with exponential backoff / `Retry-After` (`MAX_ATTEMPTS
-  = 3`), and a small TTL cache for GETs keyed on `(path, params)` (`get`/`post`/`put` are the only entry
-  points tools should use — `post`/`put` call `invalidate_cache(path)`, which clears only the top-level
-  resource segment via `_resource()`, so writing a ticket doesn't drop the Help Center cache;
-  `invalidate_cache(None)` clears everything and is what `webhooks.py` uses). Several tools lean on that
-  cache to keep repeated reference lookups cheap (`resolve_group_id`, `_field_titles`, the Help Center
-  section lookups) — don't assume a redundant-looking GET is a redundant request. `_parse` is the single
-  place HTTP status codes become `ZendeskAPIError` — never let a raw `httpx.Response` or exception leak
-  past `ZendeskClient` into tool code.
+  Zendesk 401s the token endpoint if it carries the expired bearer token), retry with exponential backoff
+  / `Retry-After` (`MAX_ATTEMPTS = 3`) on 429, 502/503/504, and network/transport errors
+  (`httpx.TransportError`; a bare 500 is deliberately *not* retried — it can be a deterministic
+  server-side bug rather than a transient blip), and a small TTL cache for GETs keyed on `(path, params)`
+  (`get`/`post`/`put` are the only entry points tools should use — `post`/`put` call
+  `invalidate_cache(path)`, which clears only the top-level resource segment via `_resource()`, so
+  writing a ticket doesn't drop the Help Center cache; `invalidate_cache(None)` clears everything and is
+  what `webhooks.py` uses). Several tools lean on that cache to keep repeated reference lookups cheap
+  (`resolve_group_id`, `_field_titles`, the Help Center section lookups) — don't assume a
+  redundant-looking GET is a redundant request. `_parse` is the single place HTTP status codes become
+  `ZendeskAPIError` — never let a raw `httpx.Response` or exception leak past `ZendeskClient` into tool
+  code; a network error exhausting retries is likewise wrapped into `ZendeskAPIError` in
+  `_send_with_retry` rather than left to propagate as a raw `httpx` exception.
 - **`auth.py`** (`BearerAuthMiddleware`) protects the MCP server itself and is independent from Zendesk
   auth — it's a `{token: client_id}` map (inverted from `MCP_SERVER_API_KEYS`'s `{client_id: token}` shape
   in config.py) so each client's token can be revoked individually. Uses `hmac.compare_digest` for the
-  token comparison; `exempt_paths` carves out the webhook route.
+  token comparison; `exempt_paths` carves out the webhook route. Two independent throttles, both keyed
+  by a `{key: (count, timestamp)}` dict: `_failures` (by source IP, counts *failed* auth attempts,
+  exponential backoff, always on) and `_client_requests` (by `client_id`, counts *successful* requests in
+  a fixed window, opt-in via `client_rate_limit_max_requests` — `None` disables it, matching the
+  cache/webhook pattern of off-unless-configured). The client-request limiter exists because every client
+  shares the same Zendesk OAuth credentials/rate limit, so one misbehaving client can otherwise starve
+  every other client of it.
 - **`webhooks.py`** is optional (only wired up if `ZENDESK_WEBHOOK_SECRET` is set): verifies Zendesk's HMAC
   webhook signature and calls `client.invalidate_cache()` on any event, independent of the bearer-token
   auth path (it's added to `exempt_paths` since Zendesk signs the payload itself instead).
@@ -85,11 +95,15 @@ Request flow: `BearerAuthMiddleware` (auth.py) wraps the whole ASGI app → MCP'
 - `get_ticket`/`create_ticket`/`update_ticket`/`add_comment` all return through
   `tickets._ticket_detail`, which resolves custom-field IDs to names via `_field_titles`
   (`/ticket_fields.json`) — but only when the ticket actually has custom fields set, so tickets without
-  them cost no extra request.
+  them cost no extra request. `_project_ticket_detail` also reprojects `satisfaction_rating` (already in
+  `TICKET_DETAIL_FIELDS`) down to `SATISFACTION_FIELDS` (`score`, `comment`) and truncates a long comment
+  — it isn't propagated to `list_tickets`/`search_tickets`'s summary shape (`TICKET_SUMMARY_FIELDS`
+  doesn't include it), only the single-ticket detail path.
 - `get_ticket_comments` defaults to `limit=20` and accepts `sort_order` (`"desc"` for the tail of a long
   thread); `get_ticket_audits` accepts `field_name` to return one field's history. Both exist so a long
   ticket doesn't have to be read in full to answer a narrow question — its `count` is post-filter and can
-  be 0 with a non-null `next_cursor`.
+  be 0 with a non-null `next_cursor`. Comments carry an `attachments` list (via `ATTACHMENT_FIELDS`) when
+  the raw comment has one — metadata only (filename/url/type/size), no upload support.
 - `add_comment(..., public=False)` creates an internal note; both the tool docstring and
   `tools/tickets.add_comment` flag that internal notes may carry sensitive internal context that shouldn't
   be surfaced unless the user explicitly asked for it — preserve that behavior in any related change.
