@@ -1,33 +1,89 @@
 # MCP Server - Zendesk
 
-Servidor MCP (Model Context Protocol) em Python que expõe operações do Zendesk como ferramentas utilizáveis pelo Claude.
+<p align="center">
+  <strong>Zendesk no Claude, com token por cliente e allowlist de IP.</strong>
+</p>
+
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="Licença MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/MCP-server-6E56CF" alt="Servidor MCP">
+  <img src="https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready">
+</p>
+
+<p align="center">
+  <a href="#veja-em-ação">Veja em ação</a> ·
+  <a href="#funcionalidades">Funcionalidades</a> ·
+  <a href="#stack">Stack</a> ·
+  <a href="#1-instalação">Instalação</a> ·
+  <a href="#4-executando-o-servidor">Deploy</a> ·
+  <a href="#9-solução-de-problemas">Troubleshooting</a> ·
+  <a href="#licença">Licença</a>
+</p>
+
+Servidor MCP (Model Context Protocol) em Python que expõe operações do Zendesk como ferramentas
+utilizáveis pelo Claude — chamados, busca, usuários/organizações e artigos do Help Center — pensado
+para rodar remotamente atrás de um proxy reverso, com token bearer por cliente e allowlist de IP como
+camadas extras de defesa.
+
+---
+
+## Veja em ação
+
+Depois de conectado, basta pedir em linguagem natural:
+
+> "Liste os 5 tickets mais recentes no Zendesk"
+
+O Claude chama `list_tickets`, e a resposta já vem com status, prioridade, solicitante, atendente e
+grupo resolvidos por nome — sem chamadas extras para descobrir quem é quem. O mesmo vale para buscar
+por texto livre ou sintaxe estruturada (`status:open priority:high`), abrir/editar chamados, adicionar
+comentários (públicos ou notas internas) e consultar ou publicar artigos do Help Center.
+
+Lista completa de ferramentas: [seção Funcionalidades](#funcionalidades) abaixo. Passo a passo de
+verificação ponta a ponta: [seção 6](#6-verificando-se-está-funcionando).
+
+---
 
 ## Funcionalidades
 
-**Chamados (tickets)**
-- `list_tickets` — lista chamados, com filtro opcional por status, prioridade, e-mail do solicitante ou grupo; ordenação (`sort_by`/`sort_order`), paginação por cursor e `limit` de resultados por chamada (padrão 25).
-- `get_ticket` — detalhes completos de um chamado por ID; descrição longa é truncada (avisa via `description_truncated`). Campos personalizados vêm com o nome do campo, não só o ID numérico. Quando existe, `satisfaction_rating` traz a nota do cliente (`good`/`bad`/`offered`/`unoffered`) e o comentário, se houver.
-- `create_ticket` — abre um novo chamado.
-- `update_ticket` — altera status, prioridade, atendente ou tags.
-- `add_comment` — adiciona um comentário público ou nota interna (visibilidade sempre explícita).
-- `get_ticket_comments` — histórico de comentários do chamado, paginado e limitado (`limit`, padrão 20); do mais antigo para o mais recente, ou só o fim da conversa com `sort_order="desc"`; corpo de comentário longo é truncado. Comentário com arquivo anexado traz `attachments` (nome, url, tipo, tamanho).
-- `get_ticket_audits` — histórico de mudanças do chamado (quem alterou o quê e quando), paginado e limitado (`limit`, padrão 50); aceita `field_name` para ver só as mudanças de um campo (ex.: `status`); valores longos são truncados.
+### Chamados (tickets)
 
-**Busca**
-- `search_tickets` — busca por texto livre ou sintaxe estruturada do Zendesk (`status:open priority:high`), com ordenação, paginação por cursor e `limit` de resultados (padrão 25).
+| Ferramenta | O que faz |
+|---|---|
+| `list_tickets` | Lista chamados, com filtro opcional por status, prioridade, e-mail do solicitante ou grupo; ordenação (`sort_by`/`sort_order`), paginação por cursor e `limit` de resultados por chamada (padrão 25). |
+| `get_ticket` | Detalhes completos de um chamado por ID; descrição longa é truncada (avisa via `description_truncated`). Campos personalizados vêm com o nome do campo, não só o ID numérico. Quando existe, `satisfaction_rating` traz a nota do cliente (`good`/`bad`/`offered`/`unoffered`) e o comentário, se houver. |
+| `create_ticket` | Abre um novo chamado. |
+| `update_ticket` | Altera status, prioridade, atendente ou tags. |
+| `add_comment` | Adiciona um comentário público ou nota interna (visibilidade sempre explícita). |
+| `get_ticket_comments` | Histórico de comentários do chamado, paginado e limitado (`limit`, padrão 20); do mais antigo para o mais recente, ou só o fim da conversa com `sort_order="desc"`; corpo de comentário longo é truncado. Comentário com arquivo anexado traz `attachments` (nome, url, tipo, tamanho). |
+| `get_ticket_audits` | Histórico de mudanças do chamado (quem alterou o quê e quando), paginado e limitado (`limit`, padrão 50); aceita `field_name` para ver só as mudanças de um campo (ex.: `status`); valores longos são truncados. |
 
-**Usuários e organização**
-- `get_user` — busca um usuário por ID ou e-mail.
-- `list_organizations` — lista organizações cadastradas, ou busca por nome parcial (`name`) sem paginar a conta inteira.
-- `list_groups` — lista grupos de atendimento (usado também para resolver nome de grupo em `list_tickets`).
+### Busca
 
-**Help Center (guias)**
-- `search_guides` — busca artigos por palavra-chave; devolve só snippet (≈280 caracteres), nunca o corpo, com limite baixo por padrão (5).
-- `get_guide` — conteúdo completo de um artigo, com HTML convertido para texto legível e truncado em 8.000 caracteres (avisa via `truncated`). Artigo restrito (403) retorna mensagem clara em vez do erro genérico de credencial.
-- `list_guide_categories` — categorias com as seções já aninhadas dentro, para navegação exploratória.
-- `create_guide` — cria um artigo; `draft` (rascunho ou já publicado) e `visibility` são sempre explícitos, nunca têm valor padrão. `section`, `permission_group` e `visibility` aceitam nome ou ID numérico (`visibility` também aceita `"everyone"`).
-- `update_guide` — altera título, corpo ou status de publicação de um artigo existente (via tradução do `locale`, já que o Zendesk não edita título/corpo pelo endpoint de artigo).
-- `list_guide_permissions` — lista permission groups e user segments disponíveis, para preencher `permission_group` e `visibility` de `create_guide`.
+| Ferramenta | O que faz |
+|---|---|
+| `search_tickets` | Busca por texto livre ou sintaxe estruturada do Zendesk (`status:open priority:high`), com ordenação, paginação por cursor e `limit` de resultados (padrão 25). |
+
+### Usuários e organização
+
+| Ferramenta | O que faz |
+|---|---|
+| `get_user` | Busca um usuário por ID ou e-mail. |
+| `list_organizations` | Lista organizações cadastradas, ou busca por nome parcial (`name`) sem paginar a conta inteira. |
+| `list_groups` | Lista grupos de atendimento (usado também para resolver nome de grupo em `list_tickets`). |
+
+### Help Center (guias)
+
+| Ferramenta | O que faz |
+|---|---|
+| `search_guides` | Busca artigos por palavra-chave; devolve só snippet (≈280 caracteres), nunca o corpo, com limite baixo por padrão (5). |
+| `get_guide` | Conteúdo completo de um artigo, com HTML convertido para texto legível e truncado em 8.000 caracteres (avisa via `truncated`). Artigo restrito (403) retorna mensagem clara em vez do erro genérico de credencial. |
+| `list_guide_categories` | Categorias com as seções já aninhadas dentro, para navegação exploratória. |
+| `create_guide` | Cria um artigo; `draft` (rascunho ou já publicado) e `visibility` são sempre explícitos, nunca têm valor padrão. `section`, `permission_group` e `visibility` aceitam nome ou ID numérico (`visibility` também aceita `"everyone"`). |
+| `update_guide` | Altera título, corpo ou status de publicação de um artigo existente (via tradução do `locale`, já que o Zendesk não edita título/corpo pelo endpoint de artigo). |
+| `list_guide_permissions` | Lista permission groups e user segments disponíveis, para preencher `permission_group` e `visibility` de `create_guide`. |
+
+### Decisões de design
 
 Todas as respostas trazem só os campos relevantes (não o objeto bruto do Zendesk); as listagens de
 chamados já incluem nome do solicitante/atendente/grupo/organização, sem chamadas extras. Campos de
@@ -56,6 +112,22 @@ custava percorrer todas as páginas de seções **e** de categorias do Help Cent
 busca). Agora `search_guides` busca apenas as seções dos resultados que sobraram depois do corte por
 `limit`, e `get_guide` traz seção e categoria na própria requisição do artigo
 (`?include=sections,categories`) — uma requisição em vez de dezenas.
+
+---
+
+## Stack
+
+- **Python 3.11+**, via [`mcp`](https://pypi.org/project/mcp/) (SDK oficial do Model Context Protocol)
+- `httpx` para as chamadas ao Zendesk, com retry/backoff e cache de leitura embutidos (`client.py`)
+- `starlette` + `uvicorn` como transporte HTTP do servidor MCP
+- `pydantic` para validação
+- Deploy via **Docker** (`Dockerfile` + `docker-compose.yml`) com **Caddy** na frente, TLS automático (Let's Encrypt)
+- Testes com `pytest` + `pytest-asyncio` + `respx` (`tests/`)
+
+Detalhes de arquitetura (fluxo de request, middleware de auth, cache, convenções de teste) estão em
+[`CLAUDE.md`](./CLAUDE.md).
+
+---
 
 ## 1. Instalação
 
@@ -139,8 +211,14 @@ O servidor roda via Docker Compose: o `docker-compose.yml` builda a imagem a par
 sobe, junto com o app, um proxy Caddy na frente dele, com TLS automático (Let's Encrypt) — não é preciso
 instalar Nginx/Caddy separadamente na instância.
 
-1. Configure o domínio no `Caddyfile` (raiz do projeto), trocando o placeholder pelo domínio público
-   real (o mesmo que será usado para registrar o servidor no Claude, [seção 5](#5-configurando-o-claude-para-usar-o-token)):
+1. Copie o arquivo de exemplo do Caddy e configure o domínio real:
+
+   ```bash
+   cp Caddyfile.example Caddyfile
+   ```
+
+   Troque o placeholder pelo domínio público real (o mesmo que será usado para registrar o servidor no
+   Claude, [seção 5](#5-configurando-o-claude-para-usar-o-token)):
 
    ```
    https://mcp-zendesk.suaempresa.com {
@@ -149,7 +227,8 @@ instalar Nginx/Caddy separadamente na instância.
    ```
 
    Esse domínio precisa já resolver, via DNS, para o IP público desta instância antes de subir os
-   containers, senão o Caddy não consegue emitir o certificado.
+   containers, senão o Caddy não consegue emitir o certificado. `Caddyfile` (sem sufixo) é o arquivo
+   que o `docker-compose.yml` monta de fato — `Caddyfile.example` é só o template versionado no repo.
 
 2. Com o `.env` preenchido (seções 2-3), suba os dois containers:
 
@@ -342,3 +421,9 @@ falham na verificação de assinatura e são rejeitados com 401.
 | Erros 502/503/504 do Zendesk | Zendesk temporariamente indisponível | O servidor já tenta de novo sozinho (backoff exponencial); se persistir, é uma instabilidade do lado do Zendesk |
 | Container do `app` reinicia em loop | `.env` incompleto/inválido (`load_settings` falha na subida) | Confira `docker compose logs app` pela mensagem de variável faltando e corrija o `.env` |
 | `401` em `POST /webhooks/zendesk` | `ZENDESK_WEBHOOK_SECRET` não bate com o signing secret configurado no Zendesk | Confirme o valor no Admin Center (Apps and integrations > Webhooks) e no `.env`; reinicie o servidor |
+
+---
+
+## Licença
+
+[MIT](./LICENSE)
